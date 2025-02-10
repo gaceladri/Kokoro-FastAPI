@@ -4,12 +4,14 @@
 
 # <sub><sub>_`FastKoko`_ </sub></sub>
 [![Tests](https://img.shields.io/badge/tests-69%20passed-darkgreen)]()
-[![Coverage](https://img.shields.io/badge/coverage-51%25-tan)]()
+[![Coverage](https://img.shields.io/badge/coverage-52%25-tan)]()
 [![Try on Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Try%20on-Spaces-blue)](https://huggingface.co/spaces/Remsky/Kokoro-TTS-Zero)
 
+[![Kokoro](https://img.shields.io/badge/kokoro-v0.7.9::31a2b63-BB5420)]()
+[![Misaki](https://img.shields.io/badge/misaki-v0.7.9::ebc76c2-B8860B)]()
+
 [![Tested at Model Commit](https://img.shields.io/badge/last--tested--model--commit-1.0::9901c2b-blue)](https://huggingface.co/hexgrad/Kokoro-82M/commit/9901c2b79161b6e898b7ea857ae5298f47b8b0d6)
-[![Kokoro](https://img.shields.io/badge/kokoro-v0.7.9-BB5420)]()
-[![Misaki](https://img.shields.io/badge/misaki-v0.7.9-B8860B)]()
+
 
 Dockerized FastAPI wrapper for [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) text-to-speech model
 - Multi-language support (English, Japanese, Korean, Chinese, Vietnamese)
