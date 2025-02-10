@@ -7,8 +7,8 @@
 [![Coverage](https://img.shields.io/badge/coverage-52%25-tan)]()
 [![Try on Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Try%20on-Spaces-blue)](https://huggingface.co/spaces/Remsky/Kokoro-TTS-Zero)
 
-[![Kokoro](https://img.shields.io/badge/kokoro-v0.7.9::31a2b63-BB5420)]()
-[![Misaki](https://img.shields.io/badge/misaki-v0.7.9::ebc76c2-B8860B)]()
+[![Kokoro](https://img.shields.io/badge/kokoro-v0.7.9::31a2b63-BB5420)](https://github.com/hexgrad/kokoro)
+[![Misaki](https://img.shields.io/badge/misaki-v0.7.9::ebc76c2-B8860B)](https://github.com/hexgrad/misaki)
 
 [![Tested at Model Commit](https://img.shields.io/badge/last--tested--model--commit-1.0::9901c2b-blue)](https://huggingface.co/hexgrad/Kokoro-82M/commit/9901c2b79161b6e898b7ea857ae5298f47b8b0d6)
 
@@ -33,9 +33,11 @@ Pre built images are available to run, with arm/multi-arch support, and baked in
 Refer to the core/config.py file for a full list of variables which can be managed via the environment
 
 ```bash
+# the `latest` tag can be used, but should not be considered stable as it may include `nightly` branch builds
+# it may have some bonus features however, and feedback/testing is welcome
 
-docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:v0.2.0post4 # CPU, or:
-docker run --gpus all -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-gpu:v0.2.0post4  #NVIDIA GPU
+docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:v0.2.1 # CPU, or:
+docker run --gpus all -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-gpu:v0.2.1  #NVIDIA GPU
 ```
 
 
