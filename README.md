@@ -351,7 +351,7 @@ cd docker/cpu
 docker compose up --build
 
 ```
-*Note: Overall speed may have reduced somewhat with the structural changes to accomodate streaming. Looking into it* 
+*Note: Overall speed may have reduced somewhat with the structural changes to accommodate streaming. Looking into it* 
 </details>
 
 <details>
