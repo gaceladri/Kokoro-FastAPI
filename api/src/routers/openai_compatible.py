@@ -137,7 +137,7 @@ async def stream_audio_chunks(
             voice=voice_name,
             speed=request.speed,
             output_format=request.response_format,
-            lang_code=request.lang_code or request.voice[0],
+            lang_code=request.lang_code if request.lang_code else (settings.default_voice_code if settings.default_voice_code else voice_name[0].lower()),
         ):
             # Check if client is still connected
             is_disconnected = client_request.is_disconnected
