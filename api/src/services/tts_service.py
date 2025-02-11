@@ -67,6 +67,8 @@ class TTSService:
                         np.array([0], dtype=np.float32),  # Dummy data for type checking
                         24000,
                         output_format,
+                        speed,
+                        "",
                         is_first_chunk=False,
                         normalizer=normalizer,
                         is_last_chunk=True,
@@ -97,15 +99,22 @@ class TTSService:
                                     chunk_audio,
                                     24000,
                                     output_format,
+                                    speed,
+                                    chunk_text,
                                     is_first_chunk=is_first,
-                                    normalizer=normalizer,
                                     is_last_chunk=is_last,
+                                    normalizer=normalizer,
                                 )
                                 yield converted
                             except Exception as e:
                                 logger.error(f"Failed to convert audio: {str(e)}")
                         else:
-                            yield chunk_audio
+                            trimmed = await AudioService.trim_audio(chunk_audio,
+                                                                    chunk_text,
+                                                                    speed,
+                                                                    is_last,
+                                                                    normalizer)
+                            yield trimmed
                 else:
                     # For legacy backends, load voice tensor
                     voice_tensor = await self._voice_manager.load_voice(
@@ -130,6 +139,8 @@ class TTSService:
                                 chunk_audio,
                                 24000,
                                 output_format,
+                                speed,
+                                chunk_text,
                                 is_first_chunk=is_first,
                                 normalizer=normalizer,
                                 is_last_chunk=is_last,
@@ -138,7 +149,12 @@ class TTSService:
                         except Exception as e:
                             logger.error(f"Failed to convert audio: {str(e)}")
                     else:
-                        yield chunk_audio
+                        trimmed = await AudioService.trim_audio(chunk_audio,
+                                                                    chunk_text,
+                                                                    speed,
+                                                                    is_last,
+                                                                    normalizer)
+                        yield trimmed
             except Exception as e:
                 logger.error(f"Failed to process tokens: {str(e)}")
 

@@ -144,7 +144,7 @@ class KokoroV1(BaseModelBackend):
             pipeline = self._get_pipeline(pipeline_lang_code)
 
             logger.debug(
-                f"Generating audio from tokens with lang_code '{pipeline_lang_code}': '{tokens[:100]}...'"
+                f"Generating audio from tokens with lang_code '{pipeline_lang_code}': '{tokens[:100]}{'...' if len(tokens) > 100 else ''}'"
             )
             for result in pipeline.generate_from_tokens(
                 tokens=tokens, voice=voice_path, speed=speed, model=self._model
@@ -192,7 +192,6 @@ class KokoroV1(BaseModelBackend):
         """
         if not self.is_loaded:
             raise RuntimeError("Model not loaded")
-
         try:
             # Memory management for GPU
             if self._device == "cuda":
@@ -237,7 +236,7 @@ class KokoroV1(BaseModelBackend):
             pipeline = self._get_pipeline(pipeline_lang_code)
 
             logger.debug(
-                f"Generating audio for text with lang_code '{pipeline_lang_code}': '{text[:100]}...'"
+                f"Generating audio for text with lang_code '{pipeline_lang_code}': '{text[:100]}{'...' if len(text) > 100 else ''}'"
             )
             for result in pipeline(
                 text, voice=voice_path, speed=speed, model=self._model

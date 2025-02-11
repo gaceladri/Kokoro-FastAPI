@@ -28,8 +28,11 @@ class Settings(BaseSettings):
     target_min_tokens: int = 175  # Target minimum tokens per chunk
     target_max_tokens: int = 250  # Target maximum tokens per chunk
     absolute_max_tokens: int = 450  # Absolute maximum tokens per chunk
+    advanced_text_normalization: bool = True # Preproesses the text before misiki which leads 
 
-    gap_trim_ms: int = 250  # Amount to trim from streaming chunk ends in milliseconds
+    gap_trim_ms: int = 1  # Base amount to trim from streaming chunk ends in milliseconds
+    dynamic_gap_trim_padding_ms: int = 410 # Padding to add to dynamic gap trim
+    dynamic_gap_trim_padding_char_multiplier: dict[str,float] = {".":1,"!":0.9,"?":1,",":0.8}
 
     # Web Player Settings
     enable_web_player: bool = True  # Whether to serve the web player UI
