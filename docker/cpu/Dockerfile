@@ -20,7 +20,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     mv /root/.local/bin/uvx /usr/local/bin/
 
 # Create non-root user and set up directories and permissions
-RUN useradd -m -u 1001 appuser && \
+RUN useradd -m -u 1000 appuser && \
     mkdir -p /app/api/src/models/v1_0 && \
     chown -R appuser:appuser /app
 
@@ -32,7 +32,7 @@ COPY --chown=appuser:appuser pyproject.toml ./pyproject.toml
 
 # Install dependencies
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv venv --python 3.11 && \
+    uv venv --python 3.10 && \
     uv sync --extra cpu
 
 # Copy project files including models
@@ -40,7 +40,6 @@ COPY --chown=appuser:appuser api ./api
 COPY --chown=appuser:appuser web ./web
 COPY --chown=appuser:appuser docker/scripts/ ./
 RUN chmod +x ./entrypoint.sh
-RUN sed -i 's/\r$//' ./entrypoint.sh
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
