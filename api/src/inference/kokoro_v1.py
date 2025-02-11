@@ -139,8 +139,14 @@ class KokoroV1(BaseModelBackend):
             await paths.save_voice_tensor(voice_tensor, temp_path)
             voice_path = temp_path
 
-            # Use provided lang_code or get from voice name
-            pipeline_lang_code = lang_code if lang_code else voice_name[0].lower()
+            # Use provided lang_code, settings voice code override, or first letter of voice name
+            if lang_code: # api is given priority
+                pipeline_lang_code = lang_code
+            elif settings.default_voice_code: # settings is next priority
+                pipeline_lang_code = settings.default_voice_code
+            else: # voice name is default/fallback
+                pipeline_lang_code = voice_name[0].lower()
+
             pipeline = self._get_pipeline(pipeline_lang_code)
 
             logger.debug(
@@ -231,8 +237,8 @@ class KokoroV1(BaseModelBackend):
             await paths.save_voice_tensor(voice_tensor, temp_path)
             voice_path = temp_path
 
-            # Use provided lang_code or get from voice name
-            pipeline_lang_code = lang_code if lang_code else voice_name[0].lower()
+            # Use provided lang_code, settings voice code override, or first letter of voice name
+            pipeline_lang_code = lang_code if lang_code else (settings.default_voice_code if settings.default_voice_code else voice_name[0].lower())
             pipeline = self._get_pipeline(pipeline_lang_code)
 
             logger.debug(
