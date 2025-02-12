@@ -229,6 +229,10 @@ def normalize_text(text: str,normalization_options: NormalizationOptions) -> str
     if normalization_options.unit_normalization:
         text=UNIT_PATTERN.sub(handle_units,text)
     
+    # Replace optional pluralization
+    if normalization_options.optional_pluralization_normalization:
+        text = re.sub(r"\(s\)","s",text)
+    
     # Replace quotes and brackets
     text = text.replace(chr(8216), "'").replace(chr(8217), "'")
     text = text.replace("«", chr(8220)).replace("»", chr(8221))
@@ -276,6 +280,6 @@ def normalize_text(text: str,normalization_options: NormalizationOptions) -> str
     text = re.sub(
         r"(?:[A-Za-z]\.){2,} [a-z]", lambda m: m.group().replace(".", "-"), text
     )
-    text = re.sub(r"(?i)(?<=[A-Z])\.(?=[A-Z])", "-", text)
+    text = re.sub( r"(?i)(?<=[A-Z])\.(?=[A-Z])", "-", text)
 
     return text.strip()
