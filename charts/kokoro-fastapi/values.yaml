@@ -45,8 +45,8 @@ ingress:
   host:
     name: kokoro.example.com
     endpoints:
-      backend:
-        path: "/"
+      - paths:
+          - "/"
         serviceName: "fastapi"
         servicePort: 8880
 
