@@ -10,7 +10,7 @@ from ...core.config import settings
 from .normalizer import normalize_text
 from .phonemizer import phonemize
 from .vocabulary import tokenize
-
+from ...structures.schemas import NormalizationOptions
 
 def process_text_chunk(
     text: str, language: str = "a", skip_phonemize: bool = False
@@ -87,8 +87,6 @@ def process_text(text: str, language: str = "a") -> List[int]:
 
 def get_sentence_info(text: str) -> List[Tuple[str, List[int], int]]:
     """Process all sentences and return info."""
-    if settings.advanced_text_normalization:
-        text=normalize_text(text)
     sentences = re.split(r"([.!?;:])(?=\s|$)", text)
     results = []
     for i in range(0, len(sentences), 2):
@@ -106,12 +104,18 @@ def get_sentence_info(text: str) -> List[Tuple[str, List[int], int]]:
 
 
 async def smart_split(
-    text: str, max_tokens: int = settings.absolute_max_tokens
+    text: str, 
+    max_tokens: int = settings.absolute_max_tokens,
+    normalization_options: NormalizationOptions = NormalizationOptions()
 ) -> AsyncGenerator[Tuple[str, List[int]], None]:
     """Build optimal chunks targeting 300-400 tokens, never exceeding max_tokens."""
     start_time = time.time()
     chunk_count = 0
     logger.info(f"Starting smart split for {len(text)} chars")
+
+    # Normilize text
+    if settings.advanced_text_normalization and normalization_options.normalize:
+        text=normalize_text(text,normalization_options)
 
     # Process all sentences
     sentences = get_sentence_info(text)

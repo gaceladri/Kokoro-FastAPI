@@ -36,7 +36,13 @@ class CaptionedSpeechResponse(BaseModel):
     audio: bytes = Field(..., description="The generated audio data")
     words: List[WordTimestamp] = Field(..., description="Word-level timestamps")
 
-
+class NormalizationOptions(BaseModel):
+    """Options for the normalization system"""
+    normalize: bool = Field(default=True, description="Normalizes input text to make it easier for the model to say")
+    unit_normalization: bool = Field(default=False,description="Transforms units like 10KB to 10 kilobytes")
+    url_normalization: bool = Field(default=True, description="Changes urls so they can be properly pronouced by kokoro")
+    email_normalization: bool = Field(default=True, description="Changes emails so they can be properly pronouced by kokoro")
+    
 class OpenAISpeechRequest(BaseModel):
     """Request schema for OpenAI-compatible speech endpoint"""
 
@@ -70,6 +76,10 @@ class OpenAISpeechRequest(BaseModel):
     lang_code: Optional[str] = Field(
         default=None,
         description="Optional language code to use for text processing. If not provided, will use first letter of voice name.",
+    )
+    normalization_options: Optional[NormalizationOptions] = Field(
+        default= NormalizationOptions(),
+        description= "Options for the normalization system"
     )
 
 

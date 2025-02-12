@@ -8,6 +8,8 @@ import re
 from functools import lru_cache
 import inflect
 
+from ...structures.schemas import NormalizationOptions
+
 # Constants
 VALID_TLDS = [
     "com",
@@ -112,10 +114,10 @@ def split_num(num: re.Match[str]) -> str:
     return f"{left} {right}{s}"
 
 def handle_units(u: re.Match[str]) -> str:
+    """Converts units to their full form"""
     unit_string=u.group(6).strip() 
     unit=unit_string
     
-    print(unit)
     if unit_string.lower() in VALID_UNITS:
         unit=VALID_UNITS[unit_string.lower()].split(" ")
         
@@ -213,24 +215,19 @@ def handle_url(u: re.Match[str]) -> str:
     return re.sub(r"\s+", " ", url).strip()
 
 
-def normalize_urls(text: str) -> str:
-    """Pre-process URLs before other text normalization"""
-    # Handle email addresses first
-    text = EMAIL_PATTERN.sub(handle_email, text)
-
-    # Handle URLs
-    text = URL_PATTERN.sub(handle_url, text)
-
-    return text
-
-
-def normalize_text(text: str) -> str:
+def normalize_text(text: str,normalization_options: NormalizationOptions) -> str:
     """Normalize text for TTS processing"""
-    # Pre-process URLs first
-    text = normalize_urls(text)
+    # Handle email addresses first if enabled
+    if normalization_options.email_normalization:
+        text = EMAIL_PATTERN.sub(handle_email, text)
 
-    # Pre-process numbers with units
-    text=UNIT_PATTERN.sub(handle_units,text)
+    # Handle URLs if enabled
+    if normalization_options.url_normalization:
+        text = URL_PATTERN.sub(handle_url, text)
+
+    # Pre-process numbers with units if enabled
+    if normalization_options.unit_normalization:
+        text=UNIT_PATTERN.sub(handle_units,text)
     
     # Replace quotes and brackets
     text = text.replace(chr(8216), "'").replace(chr(8217), "'")
@@ -261,12 +258,14 @@ def normalize_text(text: str) -> str:
     text = re.sub(
         r"\d*\.\d+|\b\d{4}s?\b|(?<!:)\b(?:[1-9]|1[0-2]):[0-5]\d\b(?!:)", split_num, text
     )
+    
     text = re.sub(r"(?<=\d),(?=\d)", "", text)
     text = re.sub(
         r"(?i)[$£]\d+(?:\.\d+)?(?: hundred| thousand| (?:[bm]|tr)illion)*\b|[$£]\d+\.\d\d?\b",
         handle_money,
         text,
     )
+    
     text = re.sub(r"\d*\.\d+", handle_decimal, text)
 
     # Handle various formatting

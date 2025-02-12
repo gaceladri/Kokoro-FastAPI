@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import re
 import tempfile
 from typing import AsyncGenerator, Dict, List, Union
 
@@ -138,6 +139,7 @@ async def stream_audio_chunks(
             speed=request.speed,
             output_format=request.response_format,
             lang_code=request.lang_code or request.voice[0],
+            normalization_options=request.normalization_options
         ):
             # Check if client is still connected
             is_disconnected = client_request.is_disconnected

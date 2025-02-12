@@ -18,7 +18,7 @@ from ..inference.voice_manager import get_manager as get_voice_manager
 from .audio import AudioNormalizer, AudioService
 from .text_processing import tokenize
 from .text_processing.text_processor import process_text_chunk, smart_split
-
+from ..structures.schemas import NormalizationOptions
 
 class TTSService:
     """Text-to-speech service."""
@@ -238,6 +238,7 @@ class TTSService:
         speed: float = 1.0,
         output_format: str = "wav",
         lang_code: Optional[str] = None,
+        normalization_options: Optional[NormalizationOptions] = NormalizationOptions()
     ) -> AsyncGenerator[bytes, None]:
         """Generate and stream audio chunks."""
         stream_normalizer = AudioNormalizer()
@@ -258,7 +259,7 @@ class TTSService:
             )
 
             # Process text in chunks with smart splitting
-            async for chunk_text, tokens in smart_split(text):
+            async for chunk_text, tokens in smart_split(text,normalization_options=normalization_options):
                 try:
                     # Process audio for chunk
                     async for result in self._process_chunk(
