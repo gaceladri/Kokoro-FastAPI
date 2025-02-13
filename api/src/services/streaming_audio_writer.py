@@ -112,7 +112,7 @@ class StreamingAudioWriter:
                         parameters.extend(
                             [
                                 "-q:a",
-                                "2",
+                                "0",  # Highest quality
                                 "-write_xing",
                                 "1",  # XING header for MP3
                                 "-id3v1",
@@ -142,7 +142,7 @@ class StreamingAudioWriter:
                     self.encoder.export(
                         output_buffer,
                         **format_args,
-                        bitrate="192k",
+                        bitrate="192k",  # Optimal for 24kHz/16-bit mono source
                         parameters=parameters,
                     )
                     self.encoder = None
@@ -189,10 +189,10 @@ class StreamingAudioWriter:
             self.encoder.export(
                 output_buffer,
                 **format_args,
-                bitrate="192k",
+                bitrate="192k",  # Optimal for 24kHz/16-bit mono source
                 parameters=[
                     "-q:a",
-                    "2",
+                    "0",  # Highest quality for chunks too
                     "-write_xing",
                     "0",  # No XING headers for chunks
                 ],
