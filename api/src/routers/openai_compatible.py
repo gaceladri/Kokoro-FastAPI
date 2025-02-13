@@ -197,7 +197,9 @@ async def create_speech(
             if request.return_download_link:
                 from ..services.temp_manager import TempFileWriter
 
-                temp_writer = TempFileWriter(request.response_format)
+                # Use download_format if specified, otherwise use response_format
+                output_format = request.download_format or request.response_format
+                temp_writer = TempFileWriter(output_format)
                 await temp_writer.__aenter__()  # Initialize temp file
 
                 # Get download path immediately after temp file creation
@@ -205,7 +207,7 @@ async def create_speech(
 
                 # Create response headers with download path
                 headers = {
-                    "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
+                    "Content-Disposition": f"attachment; filename=speech.{output_format}",
                     "X-Accel-Buffering": "no",
                     "Cache-Control": "no-cache",
                     "Transfer-Encoding": "chunked",

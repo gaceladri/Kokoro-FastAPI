@@ -39,7 +39,8 @@ export class AudioService {
                 body: JSON.stringify({
                     input: text,
                     voice: voice,
-                    response_format: 'mp3',
+                    response_format: 'mp3', // Always use mp3 for streaming playback
+                    download_format: document.getElementById('format-select').value || 'mp3', // Format for final download
                     stream: true,
                     speed: speed,
                     return_download_link: true,
