@@ -138,7 +138,7 @@ async def stream_audio_chunks(
             voice=voice_name,
             speed=request.speed,
             output_format=request.response_format,
-            lang_code=request.lang_code or request.voice[0],
+            lang_code=request.lang_code or settings.default_voice_code or voice_name[0].lower(),
             normalization_options=request.normalization_options
         ):
             # Check if client is still connected
