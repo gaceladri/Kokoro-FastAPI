@@ -10,7 +10,7 @@ from ...core.config import settings
 from .normalizer import normalize_text
 from .phonemizer import phonemize
 from .vocabulary import tokenize
-
+from ...structures.schemas import NormalizationOptions
 
 def process_text_chunk(
     text: str, language: str = "a", skip_phonemize: bool = False
@@ -26,7 +26,7 @@ def process_text_chunk(
         List of token IDs
     """
     start_time = time.time()
-
+    
     if skip_phonemize:
         # Input is already phonemes, just tokenize
         t0 = time.time()
@@ -35,12 +35,11 @@ def process_text_chunk(
     else:
         # Normal text processing pipeline
         t0 = time.time()
-        normalized = normalize_text(text)
         t1 = time.time()
 
         t0 = time.time()
         phonemes = phonemize(
-            normalized, language, normalize=False
+            text, language, normalize=False
         )  # Already normalized
         t1 = time.time()
 
@@ -50,7 +49,7 @@ def process_text_chunk(
 
     total_time = time.time() - start_time
     logger.debug(
-        f"Total processing took {total_time * 1000:.2f}ms for chunk: '{text[:50]}...'"
+        f"Total processing took {total_time * 1000:.2f}ms for chunk: '{text[:50]}{'...' if len(text) > 50 else ''}'"
     )
 
     return tokens
@@ -61,7 +60,7 @@ async def yield_chunk(
 ) -> Tuple[str, List[int]]:
     """Yield a chunk with consistent logging."""
     logger.debug(
-        f"Yielding chunk {chunk_count}: '{text[:50]}...' ({len(tokens)} tokens)"
+        f"Yielding chunk {chunk_count}: '{text[:50]}{'...' if len(text) > 50 else ''}' ({len(tokens)} tokens)"
     )
     return text, tokens
 
@@ -88,9 +87,8 @@ def process_text(text: str, language: str = "a") -> List[int]:
 
 def get_sentence_info(text: str) -> List[Tuple[str, List[int], int]]:
     """Process all sentences and return info."""
-    sentences = re.split(r"([.!?;:])", text)
+    sentences = re.split(r"([.!?;:])(?=\s|$)", text)
     results = []
-
     for i in range(0, len(sentences), 2):
         sentence = sentences[i].strip()
         punct = sentences[i + 1] if i + 1 < len(sentences) else ""
@@ -106,12 +104,18 @@ def get_sentence_info(text: str) -> List[Tuple[str, List[int], int]]:
 
 
 async def smart_split(
-    text: str, max_tokens: int = settings.absolute_max_tokens
+    text: str, 
+    max_tokens: int = settings.absolute_max_tokens,
+    normalization_options: NormalizationOptions = NormalizationOptions()
 ) -> AsyncGenerator[Tuple[str, List[int]], None]:
     """Build optimal chunks targeting 300-400 tokens, never exceeding max_tokens."""
     start_time = time.time()
     chunk_count = 0
     logger.info(f"Starting smart split for {len(text)} chars")
+
+    # Normilize text
+    if settings.advanced_text_normalization and normalization_options.normalize:
+        text=normalize_text(text,normalization_options)
 
     # Process all sentences
     sentences = get_sentence_info(text)
@@ -128,7 +132,7 @@ async def smart_split(
                 chunk_text = " ".join(current_chunk)
                 chunk_count += 1
                 logger.debug(
-                    f"Yielding chunk {chunk_count}: '{chunk_text[:50]}...' ({current_count} tokens)"
+                    f"Yielding chunk {chunk_count}: '{chunk_text[:50]}{'...' if len(text) > 50 else ''}' ({current_count} tokens)"
                 )
                 yield chunk_text, current_tokens
                 current_chunk = []
@@ -149,6 +153,7 @@ async def smart_split(
                     continue
 
                 full_clause = clause + comma
+                
                 tokens = process_text_chunk(full_clause)
                 count = len(tokens)
 
@@ -166,7 +171,7 @@ async def smart_split(
                         chunk_text = " ".join(clause_chunk)
                         chunk_count += 1
                         logger.debug(
-                            f"Yielding clause chunk {chunk_count}: '{chunk_text[:50]}...' ({clause_count} tokens)"
+                            f"Yielding clause chunk {chunk_count}: '{chunk_text[:50]}{'...' if len(text) > 50 else ''}' ({clause_count} tokens)"
                         )
                         yield chunk_text, clause_tokens
                     clause_chunk = [full_clause]
@@ -178,7 +183,7 @@ async def smart_split(
                 chunk_text = " ".join(clause_chunk)
                 chunk_count += 1
                 logger.debug(
-                    f"Yielding final clause chunk {chunk_count}: '{chunk_text[:50]}...' ({clause_count} tokens)"
+                    f"Yielding final clause chunk {chunk_count}: '{chunk_text[:50]}{'...' if len(text) > 50 else ''}' ({clause_count} tokens)"
                 )
                 yield chunk_text, clause_tokens
 
@@ -192,7 +197,7 @@ async def smart_split(
             chunk_text = " ".join(current_chunk)
             chunk_count += 1
             logger.info(
-                f"Yielding chunk {chunk_count}: '{chunk_text[:50]}...' ({current_count} tokens)"
+                f"Yielding chunk {chunk_count}: '{chunk_text[:50]}{'...' if len(text) > 50 else ''}' ({current_count} tokens)"
             )
             yield chunk_text, current_tokens
             current_chunk = [sentence]
@@ -217,7 +222,7 @@ async def smart_split(
                 chunk_text = " ".join(current_chunk)
                 chunk_count += 1
                 logger.info(
-                    f"Yielding chunk {chunk_count}: '{chunk_text[:50]}...' ({current_count} tokens)"
+                    f"Yielding chunk {chunk_count}: '{chunk_text[:50]}{'...' if len(text) > 50 else ''}' ({current_count} tokens)"
                 )
                 yield chunk_text, current_tokens
             current_chunk = [sentence]
@@ -229,7 +234,7 @@ async def smart_split(
         chunk_text = " ".join(current_chunk)
         chunk_count += 1
         logger.info(
-            f"Yielding final chunk {chunk_count}: '{chunk_text[:50]}...' ({current_count} tokens)"
+            f"Yielding final chunk {chunk_count}: '{chunk_text[:50]}{'...' if len(text) > 50 else ''}' ({current_count} tokens)"
         )
         yield chunk_text, current_tokens
 

@@ -18,7 +18,7 @@ from ..inference.voice_manager import get_manager as get_voice_manager
 from .audio import AudioNormalizer, AudioService
 from .text_processing import tokenize
 from .text_processing.text_processor import process_text_chunk, smart_split
-
+from ..structures.schemas import NormalizationOptions
 
 class TTSService:
     """Text-to-speech service."""
@@ -67,6 +67,8 @@ class TTSService:
                         np.array([0], dtype=np.float32),  # Dummy data for type checking
                         24000,
                         output_format,
+                        speed,
+                        "",
                         is_first_chunk=False,
                         normalizer=normalizer,
                         is_last_chunk=True,
@@ -97,15 +99,22 @@ class TTSService:
                                     chunk_audio,
                                     24000,
                                     output_format,
+                                    speed,
+                                    chunk_text,
                                     is_first_chunk=is_first,
-                                    normalizer=normalizer,
                                     is_last_chunk=is_last,
+                                    normalizer=normalizer,
                                 )
                                 yield converted
                             except Exception as e:
                                 logger.error(f"Failed to convert audio: {str(e)}")
                         else:
-                            yield chunk_audio
+                            trimmed = await AudioService.trim_audio(chunk_audio,
+                                                                    chunk_text,
+                                                                    speed,
+                                                                    is_last,
+                                                                    normalizer)
+                            yield trimmed
                 else:
                     # For legacy backends, load voice tensor
                     voice_tensor = await self._voice_manager.load_voice(
@@ -130,6 +139,8 @@ class TTSService:
                                 chunk_audio,
                                 24000,
                                 output_format,
+                                speed,
+                                chunk_text,
                                 is_first_chunk=is_first,
                                 normalizer=normalizer,
                                 is_last_chunk=is_last,
@@ -138,7 +149,12 @@ class TTSService:
                         except Exception as e:
                             logger.error(f"Failed to convert audio: {str(e)}")
                     else:
-                        yield chunk_audio
+                        trimmed = await AudioService.trim_audio(chunk_audio,
+                                                                    chunk_text,
+                                                                    speed,
+                                                                    is_last,
+                                                                    normalizer)
+                        yield trimmed
             except Exception as e:
                 logger.error(f"Failed to process tokens: {str(e)}")
 
@@ -222,6 +238,7 @@ class TTSService:
         speed: float = 1.0,
         output_format: str = "wav",
         lang_code: Optional[str] = None,
+        normalization_options: Optional[NormalizationOptions] = NormalizationOptions()
     ) -> AsyncGenerator[bytes, None]:
         """Generate and stream audio chunks."""
         stream_normalizer = AudioNormalizer()
@@ -242,7 +259,7 @@ class TTSService:
             )
 
             # Process text in chunks with smart splitting
-            async for chunk_text, tokens in smart_split(text):
+            async for chunk_text, tokens in smart_split(text,normalization_options=normalization_options):
                 try:
                     # Process audio for chunk
                     async for result in self._process_chunk(

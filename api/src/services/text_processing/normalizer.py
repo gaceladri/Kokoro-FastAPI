@@ -6,6 +6,9 @@ Converts them into a format suitable for text-to-speech processing.
 
 import re
 from functools import lru_cache
+import inflect
+
+from ...structures.schemas import NormalizationOptions
 
 # Constants
 VALID_TLDS = [
@@ -50,6 +53,27 @@ VALID_TLDS = [
     "io",
 ]
 
+VALID_UNITS = {
+    "m":"meter", "cm":"centimeter", "mm":"millimeter", "km":"kilometer", "in":"inch", "ft":"foot", "yd":"yard", "mi":"mile",  # Length
+    "g":"gram", "kg":"kilogram", "mg":"miligram",      # Mass
+    "s":"second", "ms":"milisecond", "min":"minutes", "h":"hour", # Time
+    "l":"liter", "ml":"mililiter", "cl":"centiliter", "dl":"deciliter",  # Volume
+    "kph":"kilometer per hour", "mph":"mile per hour","mi/h":"mile per hour", "m/s":"meter per second", "km/h":"kilometer per hour", "mm/s":"milimeter per second","cm/s":"centimeter per second", "ft/s":"feet per second","cm/h":"centimeter per day", # Speed
+    "°c":"degree celsius","c":"degree celsius", "°f":"degree fahrenheit","f":"degree fahrenheit", "k":"kelvin",     # Temperature
+    "pa":"pascal", "kpa":"kilopascal", "mpa":"megapascal", "atm":"atmosphere",  # Pressure
+    "hz":"hertz", "khz":"kilohertz", "mhz":"megahertz", "ghz":"gigahertz", # Frequency
+    "v":"volt", "kv":"kilovolt", "mv":"mergavolt",      # Voltage
+    "a":"amp", "ma":"megaamp", "ka":"kiloamp",      # Current
+    "w":"watt", "kw":"kilowatt", "mw":"megawatt",      # Power
+    "j":"joule", "kj":"kilojoule", "mj":"megajoule",      # Energy
+    "Ω":"ohm", "kΩ":"kiloohm", "mΩ":"megaohm",      # Resistance (Ohm)
+    "f":"farad", "µf":"microfarad", "nf":"nanofarad", "pf":"picofarad", # Capacitance
+    "b":"bit", "kb":"kilobit", "mb":"megabit", "gb":"gigabit", "tb":"terabit", "pb":"petabit", # Data size
+    "kbps":"kilobit per second","mbps":"megabit per second","gbps":"gigabit per second","tbps":"terabit per second",
+    "px":"pixel"  # CSS units
+}
+
+
 # Pre-compiled regex patterns for performance
 EMAIL_PATTERN = re.compile(
     r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}\b", re.IGNORECASE
@@ -61,6 +85,9 @@ URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+UNIT_PATTERN = re.compile(r"((?<!\w)([+-]?)(\d{1,3}(,\d{3})*|\d+)(\.\d+)?)\s*(" + "|".join(sorted(list(VALID_UNITS.keys()),reverse=True)) + r"""){1}(?=[^\w\d]{1}|\b)""",re.IGNORECASE)
+
+INFLECT_ENGINE=inflect.engine()
 
 def split_num(num: re.Match[str]) -> str:
     """Handle number splitting for various formats"""
@@ -86,6 +113,23 @@ def split_num(num: re.Match[str]) -> str:
             return f"{left} oh {right}{s}"
     return f"{left} {right}{s}"
 
+def handle_units(u: re.Match[str]) -> str:
+    """Converts units to their full form"""
+    unit_string=u.group(6).strip() 
+    unit=unit_string
+    
+    if unit_string.lower() in VALID_UNITS:
+        unit=VALID_UNITS[unit_string.lower()].split(" ")
+        
+        # Handles the B vs b case
+        if unit[0].endswith("bit"):
+            b_case=unit_string[min(1,len(unit_string) - 1)]
+            if b_case == "B":
+                unit[0]=unit[0][:-3] + "byte"
+            
+        number=u.group(1).strip()
+        unit[0]=INFLECT_ENGINE.no(unit[0],number)
+    return " ".join(unit)
 
 def handle_money(m: re.Match[str]) -> str:
     """Convert money expressions to spoken form"""
@@ -171,30 +215,32 @@ def handle_url(u: re.Match[str]) -> str:
     return re.sub(r"\s+", " ", url).strip()
 
 
-def normalize_urls(text: str) -> str:
-    """Pre-process URLs before other text normalization"""
-    # Handle email addresses first
-    text = EMAIL_PATTERN.sub(handle_email, text)
-
-    # Handle URLs
-    text = URL_PATTERN.sub(handle_url, text)
-
-    return text
-
-
-def normalize_text(text: str) -> str:
+def normalize_text(text: str,normalization_options: NormalizationOptions) -> str:
     """Normalize text for TTS processing"""
-    # Pre-process URLs first
-    text = normalize_urls(text)
+    # Handle email addresses first if enabled
+    if normalization_options.email_normalization:
+        text = EMAIL_PATTERN.sub(handle_email, text)
 
+    # Handle URLs if enabled
+    if normalization_options.url_normalization:
+        text = URL_PATTERN.sub(handle_url, text)
+
+    # Pre-process numbers with units if enabled
+    if normalization_options.unit_normalization:
+        text=UNIT_PATTERN.sub(handle_units,text)
+    
+    # Replace optional pluralization
+    if normalization_options.optional_pluralization_normalization:
+        text = re.sub(r"\(s\)","s",text)
+    
     # Replace quotes and brackets
     text = text.replace(chr(8216), "'").replace(chr(8217), "'")
     text = text.replace("«", chr(8220)).replace("»", chr(8221))
     text = text.replace(chr(8220), '"').replace(chr(8221), '"')
     text = text.replace("(", "«").replace(")", "»")
 
-    # Handle CJK punctuation
-    for a, b in zip("、。！，：；？", ",.!,:;?"):
+    # Handle CJK punctuation and some non standard chars
+    for a, b in zip("、。！，：；？–", ",.!,:;?-"):
         text = text.replace(a, b + " ")
 
     # Clean up whitespace
@@ -216,12 +262,14 @@ def normalize_text(text: str) -> str:
     text = re.sub(
         r"\d*\.\d+|\b\d{4}s?\b|(?<!:)\b(?:[1-9]|1[0-2]):[0-5]\d\b(?!:)", split_num, text
     )
+    
     text = re.sub(r"(?<=\d),(?=\d)", "", text)
     text = re.sub(
         r"(?i)[$£]\d+(?:\.\d+)?(?: hundred| thousand| (?:[bm]|tr)illion)*\b|[$£]\d+\.\d\d?\b",
         handle_money,
         text,
     )
+    
     text = re.sub(r"\d*\.\d+", handle_decimal, text)
 
     # Handle various formatting
@@ -232,6 +280,6 @@ def normalize_text(text: str) -> str:
     text = re.sub(
         r"(?:[A-Za-z]\.){2,} [a-z]", lambda m: m.group().replace(".", "-"), text
     )
-    text = re.sub(r"(?i)(?<=[A-Z])\.(?=[A-Z])", "-", text)
+    text = re.sub( r"(?i)(?<=[A-Z])\.(?=[A-Z])", "-", text)
 
     return text.strip()
