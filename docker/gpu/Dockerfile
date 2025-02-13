@@ -1,11 +1,11 @@
-FROM --platform=$BUILDPLATFORM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+FROM --platform=$BUILDPLATFORM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04
 # Set non-interactive frontend
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install Python and other dependencies
 RUN apt-get update && apt-get install -y \
     python3.10 \
-    python3.10-venv \
+    python3-venv \
     espeak-ng \
     espeak-ng-data \
     git \
@@ -23,7 +23,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     mv /root/.local/bin/uvx /usr/local/bin/ 
 
 # Create non-root user and set up directories and permissions
-RUN useradd -m -u 1000 appuser && \
+RUN useradd -m -u 1001 appuser && \
     mkdir -p /app/api/src/models/v1_0 && \
     chown -R appuser:appuser /app
     
@@ -39,7 +39,7 @@ ENV PHONEMIZER_ESPEAK_PATH=/usr/bin \
 
 # Install dependencies with GPU extras (using cache mounts)
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv venv && \
+    uv venv --python 3.10 && \
     uv sync --extra gpu
 
 # Copy project files including models

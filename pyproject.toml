@@ -18,8 +18,6 @@ dependencies = [
     "scipy==1.14.1",
     # Audio processing
     "soundfile==0.13.0",
-    # Text processing
-    "phonemizer==3.3.0",
     "regex==2024.11.6",
     # Utilities
     "aiofiles==23.2.1",
@@ -36,7 +34,9 @@ dependencies = [
     "kokoro @ git+https://github.com/hexgrad/kokoro.git@31a2b6337b8c1b1418ef68c48142328f640da938",
     'misaki[en,ja,ko,zh] @ git+https://github.com/hexgrad/misaki.git@ebc76c21b66c5fc4866ed0ec234047177b396170',
     "spacy==3.7.2",
-    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl"
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl",
+    "inflect>=7.5.0",
+    "phonemizer-fork>=3.3.2",
 ]
 
 [project.optional-dependencies]
