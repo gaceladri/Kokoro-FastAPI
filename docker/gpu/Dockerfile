@@ -48,13 +48,17 @@ COPY --chown=appuser:appuser web ./web
 COPY --chown=appuser:appuser docker/scripts/ ./
 RUN chmod +x ./entrypoint.sh
 
-
 # Set all environment variables in one go
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app:/app/api \
     PATH="/app/.venv/bin:$PATH" \
     UV_LINK_MODE=copy \
-    USE_GPU=true 
+    USE_GPU=true \
+    DEVICE="gpu" \
+    # Default values for Supabase config (to be overridden)
+    SUPABASE_URL="" \
+    SUPABASE_KEY="" \
+    ENABLE_USAGE_TRACKING="true"
 
 ENV DOWNLOAD_MODEL=true
 # Download model if enabled
@@ -62,6 +66,12 @@ RUN if [ "$DOWNLOAD_MODEL" = "true" ]; then \
     python download_model.py --output api/src/models/v1_0; \
     fi
 
-ENV DEVICE="gpu"
+# Create directory for environment file
+RUN mkdir -p /app/config
+
+# Copy entrypoint script that will handle environment variables
+COPY --chown=appuser:appuser docker/scripts/entrypoint.sh ./entrypoint.sh
+RUN chmod +x ./entrypoint.sh
+
 # Run FastAPI server through entrypoint.sh
 CMD ["./entrypoint.sh"]

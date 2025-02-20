@@ -16,6 +16,7 @@ from loguru import logger
 from ..core.config import settings
 from ..services.audio import AudioService
 from ..services.tts_service import TTSService
+from ..services.usage_tracking.usage_service import UsageTrackingService
 from ..structures import OpenAISpeechRequest
 
 
@@ -41,8 +42,9 @@ router = APIRouter(
     responses={404: {"description": "Not found"}},
 )
 
-# Global TTSService instance with lock
+# Global services
 _tts_service = None
+_usage_service = None
 _init_lock = None
 
 
@@ -53,7 +55,6 @@ async def get_tts_service() -> TTSService:
     # Create lock if needed
     if _init_lock is None:
         import asyncio
-
         _init_lock = asyncio.Lock()
 
     # Initialize service if needed
@@ -65,6 +66,26 @@ async def get_tts_service() -> TTSService:
                 logger.info("Created global TTSService instance")
 
     return _tts_service
+
+
+async def get_usage_service() -> UsageTrackingService:
+    """Get global UsageTrackingService instance"""
+    global _usage_service, _init_lock
+
+    # Create lock if needed
+    if _init_lock is None:
+        import asyncio
+        _init_lock = asyncio.Lock()
+
+    # Initialize service if needed
+    if _usage_service is None:
+        async with _init_lock:
+            # Double check pattern
+            if _usage_service is None:
+                _usage_service = await UsageTrackingService.create()
+                logger.info("Created global UsageTrackingService instance")
+
+    return _usage_service
 
 
 def get_model_name(model: str) -> str:
@@ -563,4 +584,61 @@ async def combine_voices(request: Union[str, List[str]]):
                 "message": "An unexpected error occurred",
                 "type": "server_error",
             },
+        )
+
+
+@router.get("/usage")
+async def get_usage_stats(
+    request: Request,
+):
+    """Get usage statistics for the current subscription period."""
+    try:
+        # Get subscription info from request state (set by middleware)
+        subscription = request.state.subscription
+        if not subscription:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "no_subscription",
+                    "message": "No active subscription found",
+                    "type": "authorization_error",
+                }
+            )
+
+        # Return current usage and limits
+        product = subscription["products"]
+        current_usage = request.state.usage["total_requests"] if request.state.usage else 0
+        current_characters = request.state.usage.get("total_characters", 0) if request.state.usage else 0
+        
+        return {
+            "subscription_id": subscription["id"],
+            "period_start": subscription["current_period_start"],
+            "period_end": subscription["current_period_end"],
+            "total_requests": current_usage,
+            "total_characters": current_characters,
+            "request_limit": product["monthly_request_limit"],
+            "character_limit": product.get("monthly_character_limit"),
+            "requests_remaining": (
+                product["monthly_request_limit"] - current_usage
+                if product["monthly_request_limit"] is not None
+                else None
+            ),
+            "characters_remaining": (
+                product["monthly_character_limit"] - current_characters
+                if product.get("monthly_character_limit") is not None
+                else None
+            )
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting usage stats: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "server_error",
+                "message": "Failed to retrieve usage statistics",
+                "type": "server_error",
+            }
         )

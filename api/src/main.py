@@ -2,22 +2,22 @@
 FastAPI OpenAI Compatible API
 """
 
-import os
 import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import torch
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from .core.config import settings
+from .core.middleware import UsageTrackingMiddleware
 from .routers.debug import router as debug_router
 from .routers.development import router as dev_router
 from .routers.openai_compatible import router as openai_router
 from .routers.web_player import router as web_router
+from .services.usage_tracking.usage_service import UsageTrackingService
 
 
 def setup_logger():
@@ -50,6 +50,7 @@ async def lifespan(app: FastAPI):
     from .inference.model_manager import get_manager
     from .inference.voice_manager import get_manager as get_voice_manager
     from .services.temp_manager import cleanup_temp_files
+    from .services.usage_tracking.usage_service import UsageTrackingService
 
     # Clean old temp files on startup
     await cleanup_temp_files()
@@ -65,6 +66,11 @@ async def lifespan(app: FastAPI):
         device, model, voicepack_count = await model_manager.initialize_with_warmup(
             voice_manager
         )
+
+        # Initialize usage tracking if enabled
+        if settings.enable_usage_tracking:
+            await UsageTrackingService.create()
+            logger.info("Usage tracking service initialized")
 
     except Exception as e:
         logger.error(f"Failed to initialize model: {e}")
@@ -122,6 +128,10 @@ if settings.cors_enabled:
         allow_headers=["*"],
     )
 
+# Add usage tracking middleware if enabled
+if settings.enable_usage_tracking:
+    app.add_middleware(UsageTrackingMiddleware)
+
 # Include routers
 app.include_router(openai_router, prefix="/v1")
 app.include_router(dev_router)  # Development endpoints
@@ -141,6 +151,39 @@ async def health_check():
 async def test_endpoint():
     """Test endpoint to verify routing"""
     return {"status": "ok"}
+
+
+# Usage statistics endpoint
+@app.get("/v1/usage")
+async def get_usage_stats(
+    request: Request,
+    usage_service: UsageTrackingService = Depends(UsageTrackingService.create)
+):
+    """Get usage statistics for the current user."""
+    if not settings.enable_usage_tracking:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "usage_tracking_disabled",
+                "message": "Usage tracking is not enabled",
+                "type": "invalid_request_error",
+            }
+        )
+
+    user_id = getattr(request.state, "user_id", "anonymous")
+    stats = await usage_service.get_user_statistics(user_id)
+    
+    if stats is None:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "usage_stats_error",
+                "message": "Failed to retrieve usage statistics",
+                "type": "server_error",
+            }
+        )
+    
+    return stats
 
 
 if __name__ == "__main__":
