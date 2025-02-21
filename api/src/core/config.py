@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     supabase_key: str | None = None
     enable_usage_tracking: bool = False
     
+    # Stripe Settings
+    stripe_secret_key: str | None = None
+    
     # Application Settings
     output_dir: str = "output"
     output_dir_size_limit_mb: float = 500.0  # Maximum size of output directory in MB

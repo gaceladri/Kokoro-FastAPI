@@ -58,7 +58,9 @@ ENV PYTHONUNBUFFERED=1 \
     # Default values for Supabase config (to be overridden)
     SUPABASE_URL="" \
     SUPABASE_KEY="" \
-    ENABLE_USAGE_TRACKING="true"
+    ENABLE_USAGE_TRACKING="true" \
+    # Stripe configuration (to be overridden)
+    STRIPE_SECRET_KEY=""
 
 ENV DOWNLOAD_MODEL=true
 # Download model if enabled
