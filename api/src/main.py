@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 
 import torch
 import uvicorn
-from fastapi import FastAPI, Depends, Request, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 

@@ -1,15 +1,16 @@
 """Middleware for authentication and usage tracking."""
 
-from typing import Optional, Dict, Tuple
-from fastapi import Request, HTTPException
-from starlette.middleware.base import BaseHTTPMiddleware
-from loguru import logger
-from datetime import datetime
 import asyncio
+from datetime import datetime
 from functools import lru_cache
+from typing import Dict, Optional, Tuple
 
-from .config import settings
+from fastapi import HTTPException, Request
+from loguru import logger
+from starlette.middleware.base import BaseHTTPMiddleware
+
 from ..services.usage_tracking.usage_service import UsageTrackingService
+from .config import settings
 
 
 class UsageTrackingMiddleware(BaseHTTPMiddleware):
