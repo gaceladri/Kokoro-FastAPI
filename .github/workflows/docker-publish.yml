@@ -80,7 +80,6 @@ jobs:
           DOCKER_BUILDKIT: 1
           BUILDKIT_STEP_LOG_MAX_SIZE: 10485760
           VERSION: ${{ needs.prepare-release.outputs.version }}
-          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
         run: docker buildx bake --push
 
   create-release:
