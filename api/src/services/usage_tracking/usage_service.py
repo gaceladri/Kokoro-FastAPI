@@ -240,16 +240,20 @@ class UsageTrackingService:
     async def _async_track_demo_request(self, ip_address: str):
         """Asynchronously update database with demo request."""
         try:
-            await (
-                self._supabase._client.table("demo_requests")
-                .insert(
-                    {
-                        "ip_address": ip_address,
-                        "request_time": datetime.utcnow().isoformat(),
-                    }
-                )
-                .execute()
-            )
+            data = await self._supabase._client.table("demo_requests").insert(
+                {
+                    "ip_address": ip_address,
+                    "request_time": datetime.utcnow().isoformat(),
+                }
+            ).execute()
         except Exception as e:
-            logger.error(f"Failed to persist demo request for IP {ip_address}: {e}")
+            error_type = type(e).__name__
+            error_details = str(e)
+            logger.error(
+                f"Failed to persist demo request:\n"
+                f"IP: {ip_address}\n"
+                f"Error Type: {error_type}\n"
+                f"Error Details: {error_details}\n"
+                f"Timestamp: {datetime.utcnow().isoformat()}"
+            )
             # Don't raise exception as this is background task
