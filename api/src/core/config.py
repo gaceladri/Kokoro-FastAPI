@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from pydantic import Field
 
 
 class Settings(BaseSettings):
@@ -54,6 +55,20 @@ class Settings(BaseSettings):
     max_temp_dir_size_mb: int = 2048  # Maximum size of temp directory (2GB)
     max_temp_dir_age_hours: int = 1  # Remove temp files older than 1 hour
     max_temp_dir_count: int = 3  # Maximum number of temp files to keep
+
+    # Demo configuration
+    demo_max_characters: int = Field(default=700, description="Maximum text length for demo requests")
+    demo_daily_limit: int = Field(default=100, description="Maximum demo requests per IP per day")
+
+    # Cache Settings
+    api_key_cache_ttl: int = Field(default=300, description="API key cache TTL in seconds")
+    api_key_cache_size: int = Field(default=1000, description="Maximum number of API keys to cache")
+    demo_cache_cleanup_interval: int = Field(default=3600, description="Demo cache cleanup interval in seconds")
+    
+    # Database Settings
+    db_pool_size: int = Field(default=20, description="Database connection pool size")
+    db_max_overflow: int = Field(default=10, description="Maximum number of connections to overflow")
+    db_pool_timeout: int = Field(default=30, description="Database pool timeout in seconds")
 
     class Config:
         env_file = ".env"

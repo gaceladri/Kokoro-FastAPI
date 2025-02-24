@@ -57,7 +57,7 @@ ingress:
 
 kokoroTTS:
   repository: "docker.io/gaceladri/kokoro-fastapi-gpu"
-  tag: "latest"
+  tag: "v0.2.2"
   pullPolicy: Always
   serviceName: "fastapi"
   port: 8880
