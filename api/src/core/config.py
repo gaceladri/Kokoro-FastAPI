@@ -14,15 +14,17 @@ class Settings(BaseSettings):
     supabase_url: str | None = None
     supabase_key: str | None = None
     enable_usage_tracking: bool = False
-    
+
     # Stripe Settings
     stripe_secret_key: str | None = None
-    
+
     # Application Settings
     output_dir: str = "output"
     output_dir_size_limit_mb: float = 500.0  # Maximum size of output directory in MB
     default_voice: str = "af_heart"
-    default_voice_code: str | None = None  # If set, overrides the first letter of voice name, though api call param still takes precedence
+    default_voice_code: str | None = (
+        None  # If set, overrides the first letter of voice name, though api call param still takes precedence
+    )
     use_gpu: bool = True  # Whether to use GPU acceleration if available
     allow_local_voice_saving: bool = (
         False  # Whether to allow saving combined voices locally
@@ -38,11 +40,20 @@ class Settings(BaseSettings):
     target_min_tokens: int = 175  # Target minimum tokens per chunk
     target_max_tokens: int = 250  # Target maximum tokens per chunk
     absolute_max_tokens: int = 450  # Absolute maximum tokens per chunk
-    advanced_text_normalization: bool = True # Preproesses the text before misiki which leads 
+    advanced_text_normalization: bool = (
+        True  # Preproesses the text before misiki which leads
+    )
 
-    gap_trim_ms: int = 1  # Base amount to trim from streaming chunk ends in milliseconds
-    dynamic_gap_trim_padding_ms: int = 410 # Padding to add to dynamic gap trim
-    dynamic_gap_trim_padding_char_multiplier: dict[str,float] = {".":1,"!":0.9,"?":1,",":0.8}
+    gap_trim_ms: int = (
+        1  # Base amount to trim from streaming chunk ends in milliseconds
+    )
+    dynamic_gap_trim_padding_ms: int = 410  # Padding to add to dynamic gap trim
+    dynamic_gap_trim_padding_char_multiplier: dict[str, float] = {
+        ".": 1,
+        "!": 0.9,
+        "?": 1,
+        ",": 0.8,
+    }
 
     # Web Player Settings
     enable_web_player: bool = True  # Whether to serve the web player UI
@@ -57,18 +68,32 @@ class Settings(BaseSettings):
     max_temp_dir_count: int = 3  # Maximum number of temp files to keep
 
     # Demo configuration
-    demo_max_characters: int = Field(default=700, description="Maximum text length for demo requests")
-    demo_daily_limit: int = Field(default=100, description="Maximum demo requests per IP per day")
+    demo_max_characters: int = Field(
+        default=700, description="Maximum text length for demo requests"
+    )
+    demo_daily_limit: int = Field(
+        default=100, description="Maximum demo requests per IP per day"
+    )
 
     # Cache Settings
-    api_key_cache_ttl: int = Field(default=300, description="API key cache TTL in seconds")
-    api_key_cache_size: int = Field(default=1000, description="Maximum number of API keys to cache")
-    demo_cache_cleanup_interval: int = Field(default=3600, description="Demo cache cleanup interval in seconds")
-    
+    api_key_cache_ttl: int = Field(
+        default=300, description="API key cache TTL in seconds"
+    )
+    api_key_cache_size: int = Field(
+        default=1000, description="Maximum number of API keys to cache"
+    )
+    demo_cache_cleanup_interval: int = Field(
+        default=3600, description="Demo cache cleanup interval in seconds"
+    )
+
     # Database Settings
     db_pool_size: int = Field(default=20, description="Database connection pool size")
-    db_max_overflow: int = Field(default=10, description="Maximum number of connections to overflow")
-    db_pool_timeout: int = Field(default=30, description="Database pool timeout in seconds")
+    db_max_overflow: int = Field(
+        default=10, description="Maximum number of connections to overflow"
+    )
+    db_pool_timeout: int = Field(
+        default=30, description="Database pool timeout in seconds"
+    )
 
     class Config:
         env_file = ".env"

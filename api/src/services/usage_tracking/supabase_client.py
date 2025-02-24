@@ -1,9 +1,10 @@
 """Supabase client for usage tracking."""
 
-from typing import Dict, Optional, Tuple
 from datetime import datetime
+from typing import Dict, Optional, Tuple
+
 from loguru import logger
-from supabase import create_client, Client
+from supabase import Client, create_client
 
 from ...core.config import settings
 
@@ -35,10 +36,10 @@ class SupabaseClient:
 
     async def validate_api_key(self, api_key_prefix: str) -> Optional[Dict]:
         """Validate an API key and return user information.
-        
+
         Args:
             api_key_prefix: First 8 characters of the API key
-            
+
         Returns:
             Optional[Dict]: User and subscription info if valid, None if invalid
         """
@@ -48,35 +49,36 @@ class SupabaseClient:
 
         try:
             # Get API key info
-            api_key = self._client.table("api_keys")\
-                .select("*, users(*)")\
-                .eq("key_prefix", api_key_prefix)\
-                .eq("is_active", True)\
-                .single()\
+            api_key = (
+                self._client.table("api_keys")
+                .select("*, users(*)")
+                .eq("key_prefix", api_key_prefix)
+                .eq("is_active", True)
+                .single()
                 .execute()
+            )
 
             if not api_key.data:
                 logger.warning(f"Invalid API key prefix: {api_key_prefix}")
                 return None
 
             # Update last_used_at
-            self._client.table("api_keys")\
-                .update({"last_used_at": datetime.utcnow().isoformat()})\
-                .eq("id", api_key.data["id"])\
-                .execute()
+            self._client.table("api_keys").update(
+                {"last_used_at": datetime.utcnow().isoformat()}
+            ).eq("id", api_key.data["id"]).execute()
 
             return api_key.data
-            
+
         except Exception as e:
             logger.error(f"Failed to validate API key: {e}")
             return None
 
     async def get_active_subscription(self, user_id: str) -> Optional[Dict]:
         """Get active subscription for a user.
-        
+
         Args:
             user_id: User identifier
-            
+
         Returns:
             Optional[Dict]: Active subscription info if exists, None otherwise
         """
@@ -86,12 +88,14 @@ class SupabaseClient:
 
         try:
             # Get active subscription with product info
-            subscription = self._client.table("subscriptions")\
-                .select("*, products(*)")\
-                .eq("user_id", user_id)\
-                .eq("status", "active")\
-                .single()\
+            subscription = (
+                self._client.table("subscriptions")
+                .select("*, products(*)")
+                .eq("user_id", user_id)
+                .eq("status", "active")
+                .single()
                 .execute()
+            )
 
             return subscription.data
 
@@ -108,14 +112,14 @@ class SupabaseClient:
         request_count: int = 1,
     ) -> bool:
         """Track usage for a subscription period.
-        
+
         Args:
             subscription_id: Subscription identifier
             period_start: Start of subscription period
             period_end: End of subscription period
             character_count: Number of characters processed
             request_count: Number of requests to add (default: 1)
-            
+
         Returns:
             bool: True if tracking successful, False otherwise
         """
@@ -125,37 +129,39 @@ class SupabaseClient:
 
         try:
             # Try to get existing usage record
-            usage = self._client.table("usage")\
-                .select("*")\
-                .eq("subscription_id", subscription_id)\
-                .eq("period_start", period_start.isoformat())\
-                .single()\
+            usage = (
+                self._client.table("usage")
+                .select("*")
+                .eq("subscription_id", subscription_id)
+                .eq("period_start", period_start.isoformat())
+                .single()
                 .execute()
+            )
 
             now = datetime.utcnow()
 
             if usage.data:
                 # Update existing record
-                self._client.table("usage")\
-                    .update({
+                self._client.table("usage").update(
+                    {
                         "total_requests": usage.data["total_requests"] + request_count,
-                        "total_characters": usage.data.get("total_characters", 0) + character_count,
-                        "last_request_at": now.isoformat()
-                    })\
-                    .eq("id", usage.data["id"])\
-                    .execute()
+                        "total_characters": usage.data.get("total_characters", 0)
+                        + character_count,
+                        "last_request_at": now.isoformat(),
+                    }
+                ).eq("id", usage.data["id"]).execute()
             else:
                 # Create new record
-                self._client.table("usage")\
-                    .insert({
+                self._client.table("usage").insert(
+                    {
                         "subscription_id": subscription_id,
                         "period_start": period_start.isoformat(),
                         "period_end": period_end.isoformat(),
                         "total_requests": request_count,
                         "total_characters": character_count,
-                        "last_request_at": now.isoformat()
-                    })\
-                    .execute()
+                        "last_request_at": now.isoformat(),
+                    }
+                ).execute()
 
             return True
 
@@ -164,18 +170,15 @@ class SupabaseClient:
             return False
 
     async def get_period_usage(
-        self,
-        subscription_id: str,
-        period_start: datetime,
-        period_end: datetime
+        self, subscription_id: str, period_start: datetime, period_end: datetime
     ) -> Optional[Dict]:
         """Get usage statistics for a subscription period.
-        
+
         Args:
             subscription_id: Subscription identifier
             period_start: Start of subscription period
             period_end: End of subscription period
-            
+
         Returns:
             Optional[Dict]: Usage statistics or None if error
         """
@@ -185,23 +188,25 @@ class SupabaseClient:
 
         try:
             # Get usage for period
-            usage = self._client.table("usage")\
-                .select("*")\
-                .eq("subscription_id", subscription_id)\
-                .eq("period_start", period_start.isoformat())\
-                .single()\
+            usage = (
+                self._client.table("usage")
+                .select("*")
+                .eq("subscription_id", subscription_id)
+                .eq("period_start", period_start.isoformat())
+                .single()
                 .execute()
+            )
 
             if not usage.data:
                 return {
                     "total_requests": 0,
                     "last_request_at": None,
                     "period_start": period_start.isoformat(),
-                    "period_end": period_end.isoformat()
+                    "period_end": period_end.isoformat(),
                 }
 
             return usage.data
 
         except Exception as e:
             logger.error(f"Failed to get usage: {e}")
-            return None 
+            return None

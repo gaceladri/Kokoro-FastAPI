@@ -157,7 +157,7 @@ async def test_endpoint():
 @app.get("/v1/usage")
 async def get_usage_stats(
     request: Request,
-    usage_service: UsageTrackingService = Depends(UsageTrackingService.create)
+    usage_service: UsageTrackingService = Depends(UsageTrackingService.create),
 ):
     """Get usage statistics for the current user."""
     if not settings.enable_usage_tracking:
@@ -167,12 +167,12 @@ async def get_usage_stats(
                 "error": "usage_tracking_disabled",
                 "message": "Usage tracking is not enabled",
                 "type": "invalid_request_error",
-            }
+            },
         )
 
     user_id = getattr(request.state, "user_id", "anonymous")
     stats = await usage_service.get_user_statistics(user_id)
-    
+
     if stats is None:
         raise HTTPException(
             status_code=500,
@@ -180,9 +180,9 @@ async def get_usage_stats(
                 "error": "usage_stats_error",
                 "message": "Failed to retrieve usage statistics",
                 "type": "server_error",
-            }
+            },
         )
-    
+
     return stats
 
 

@@ -55,6 +55,7 @@ async def get_tts_service() -> TTSService:
     # Create lock if needed
     if _init_lock is None:
         import asyncio
+
         _init_lock = asyncio.Lock()
 
     # Initialize service if needed
@@ -75,6 +76,7 @@ async def get_usage_service() -> UsageTrackingService:
     # Create lock if needed
     if _init_lock is None:
         import asyncio
+
         _init_lock = asyncio.Lock()
 
     # Initialize service if needed
@@ -159,8 +161,10 @@ async def stream_audio_chunks(
             voice=voice_name,
             speed=request.speed,
             output_format=request.response_format,
-            lang_code=request.lang_code or settings.default_voice_code or voice_name[0].lower(),
-            normalization_options=request.normalization_options
+            lang_code=request.lang_code
+            or settings.default_voice_code
+            or voice_name[0].lower(),
+            normalization_options=request.normalization_options,
         ):
             # Check if client is still connected
             is_disconnected = client_request.is_disconnected
@@ -379,26 +383,23 @@ async def list_models():
                 "id": "tts-1",
                 "object": "model",
                 "created": 1686935002,
-                "owned_by": "kokoro"
+                "owned_by": "kokoro",
             },
             {
                 "id": "tts-1-hd",
                 "object": "model",
                 "created": 1686935002,
-                "owned_by": "kokoro"
+                "owned_by": "kokoro",
             },
             {
                 "id": "kokoro",
                 "object": "model",
                 "created": 1686935002,
-                "owned_by": "kokoro"
-            }
+                "owned_by": "kokoro",
+            },
         ]
-        
-        return {
-            "object": "list",
-            "data": models
-        }
+
+        return {"object": "list", "data": models}
     except Exception as e:
         logger.error(f"Error listing models: {str(e)}")
         raise HTTPException(
@@ -410,6 +411,7 @@ async def list_models():
             },
         )
 
+
 @router.get("/models/{model}")
 async def retrieve_model(model: str):
     """Retrieve a specific model"""
@@ -420,22 +422,22 @@ async def retrieve_model(model: str):
                 "id": "tts-1",
                 "object": "model",
                 "created": 1686935002,
-                "owned_by": "kokoro"
+                "owned_by": "kokoro",
             },
             "tts-1-hd": {
                 "id": "tts-1-hd",
                 "object": "model",
                 "created": 1686935002,
-                "owned_by": "kokoro"
+                "owned_by": "kokoro",
             },
             "kokoro": {
                 "id": "kokoro",
                 "object": "model",
                 "created": 1686935002,
-                "owned_by": "kokoro"
-            }
+                "owned_by": "kokoro",
+            },
         }
-        
+
         # Check if requested model exists
         if model not in models:
             raise HTTPException(
@@ -443,10 +445,10 @@ async def retrieve_model(model: str):
                 detail={
                     "error": "model_not_found",
                     "message": f"Model '{model}' not found",
-                    "type": "invalid_request_error"
-                }
+                    "type": "invalid_request_error",
+                },
             )
-        
+
         # Return the specific model
         return models[model]
     except HTTPException:
@@ -461,6 +463,7 @@ async def retrieve_model(model: str):
                 "type": "server_error",
             },
         )
+
 
 @router.get("/audio/voices")
 async def list_voices():
@@ -602,14 +605,18 @@ async def get_usage_stats(
                     "error": "no_subscription",
                     "message": "No active subscription found",
                     "type": "authorization_error",
-                }
+                },
             )
 
         # Return current usage and limits
         product = subscription["products"]
-        current_usage = request.state.usage["total_requests"] if request.state.usage else 0
-        current_characters = request.state.usage.get("total_characters", 0) if request.state.usage else 0
-        
+        current_usage = (
+            request.state.usage["total_requests"] if request.state.usage else 0
+        )
+        current_characters = (
+            request.state.usage.get("total_characters", 0) if request.state.usage else 0
+        )
+
         return {
             "subscription_id": subscription["id"],
             "period_start": subscription["current_period_start"],
@@ -627,7 +634,7 @@ async def get_usage_stats(
                 product["monthly_character_limit"] - current_characters
                 if product.get("monthly_character_limit") is not None
                 else None
-            )
+            ),
         }
 
     except HTTPException:
@@ -640,5 +647,5 @@ async def get_usage_stats(
                 "error": "server_error",
                 "message": "Failed to retrieve usage statistics",
                 "type": "server_error",
-            }
+            },
         )

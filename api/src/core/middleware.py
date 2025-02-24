@@ -53,29 +53,33 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
             return forwarded_for.split(",")[0].strip()
         return request.client.host
 
-    async def _validate_api_key(self, api_key: str) -> Tuple[bool, Optional[str], Optional[Dict]]:
+    async def _validate_api_key(
+        self, api_key: str
+    ) -> Tuple[bool, Optional[str], Optional[Dict]]:
         """Validate API key with caching."""
         api_key_prefix = api_key[:8]
-        
+
         async with self._cache_lock:
             cached_info = self._api_key_cache.get(api_key_prefix)
             if cached_info:
                 # Check if cache is still valid (5 minutes)
-                if datetime.utcnow().timestamp() - cached_info['timestamp'] < 300:
-                    return True, None, cached_info['info']
-        
+                if datetime.utcnow().timestamp() - cached_info["timestamp"] < 300:
+                    return True, None, cached_info["info"]
+
         # Not in cache or expired, validate with service
         usage_service = await self._get_usage_service()
-        is_valid, error_message, request_info = await usage_service.validate_request(api_key_prefix)
-        
+        is_valid, error_message, request_info = await usage_service.validate_request(
+            api_key_prefix
+        )
+
         if is_valid:
             # Cache successful validations
             async with self._cache_lock:
                 self._api_key_cache[api_key_prefix] = {
-                    'timestamp': datetime.utcnow().timestamp(),
-                    'info': request_info
+                    "timestamp": datetime.utcnow().timestamp(),
+                    "info": request_info,
                 }
-        
+
         return is_valid, error_message, request_info
 
     async def dispatch(self, request: Request, call_next):
@@ -88,7 +92,7 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
             # Get API key and text length concurrently
             api_key = request.headers.get("X-API-Key")
             text_length_task = asyncio.create_task(self._get_text_length(request))
-            
+
             # Handle demo request for speech endpoint
             if request.url.path == "/v1/audio/speech" and not api_key:
                 text_length = await text_length_task
@@ -99,14 +103,16 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                             "error": "invalid_request",
                             "message": "Unable to determine text length",
                             "type": "validation_error",
-                        }
+                        },
                     )
 
                 # Validate demo request
                 usage_service = await self._get_usage_service()
                 ip_address = self.get_client_ip(request)
-                is_allowed, message = await usage_service.validate_demo_request(ip_address, text_length)
-                
+                is_allowed, message = await usage_service.validate_demo_request(
+                    ip_address, text_length
+                )
+
                 if not is_allowed:
                     raise HTTPException(
                         status_code=403,
@@ -114,7 +120,7 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                             "error": "demo_limit_exceeded",
                             "message": message,
                             "type": "authorization_error",
-                        }
+                        },
                     )
 
                 # Set demo state
@@ -130,11 +136,13 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                             "error": "missing_api_key",
                             "message": "API key is required",
                             "type": "authentication_error",
-                        }
+                        },
                     )
 
                 # Validate API key with caching
-                is_valid, error_message, request_info = await self._validate_api_key(api_key)
+                is_valid, error_message, request_info = await self._validate_api_key(
+                    api_key
+                )
                 text_length = await text_length_task
 
                 if not is_valid:
@@ -144,7 +152,7 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                             "error": "invalid_request",
                             "message": error_message,
                             "type": "authorization_error",
-                        }
+                        },
                     )
 
                 # Set request state
@@ -160,15 +168,23 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
             if response.status_code == 200 and text_length is not None:
                 usage_service = await self._get_usage_service()
                 if getattr(request.state, "is_demo", False):
-                    asyncio.create_task(usage_service.track_demo_request(request.state.ip_address))
+                    asyncio.create_task(
+                        usage_service.track_demo_request(request.state.ip_address)
+                    )
                 else:
                     subscription = request_info["subscription"]
-                    asyncio.create_task(usage_service.track_request(
-                        subscription_id=subscription["id"],
-                        period_start=datetime.fromisoformat(subscription["current_period_start"]),
-                        period_end=datetime.fromisoformat(subscription["current_period_end"]),
-                        character_count=text_length
-                    ))
+                    asyncio.create_task(
+                        usage_service.track_request(
+                            subscription_id=subscription["id"],
+                            period_start=datetime.fromisoformat(
+                                subscription["current_period_start"]
+                            ),
+                            period_end=datetime.fromisoformat(
+                                subscription["current_period_end"]
+                            ),
+                            character_count=text_length,
+                        )
+                    )
 
             return response
 
@@ -182,5 +198,5 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                     "error": "internal_error",
                     "message": "An internal error occurred",
                     "type": "server_error",
-                }
-            ) 
+                },
+            )

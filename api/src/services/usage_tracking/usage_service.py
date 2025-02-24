@@ -154,7 +154,9 @@ class UsageTrackingService:
         async with self._cache_lock:
             for ip in list(self._demo_cache.keys()):
                 # Keep only timestamps within last 24 hours
-                self._demo_cache[ip] = [ts for ts in self._demo_cache[ip] if ts > cutoff]
+                self._demo_cache[ip] = [
+                    ts for ts in self._demo_cache[ip] if ts > cutoff
+                ]
                 if not self._demo_cache[ip]:
                     del self._demo_cache[ip]
 
@@ -167,36 +169,45 @@ class UsageTrackingService:
             self._last_cleanup = now
 
         cutoff = now - 24 * 3600  # 24 hours ago
-        
+
         async with self._cache_lock:
             # Count requests in last 24 hours from cache
             count = sum(1 for ts in self._demo_cache[ip_address] if ts > cutoff)
-            
+
             # If no cached requests, check database for historical data
             if count == 0 and self._supabase._client:
                 try:
                     start_time = (datetime.utcnow() - timedelta(hours=24)).isoformat()
-                    result = self._supabase._client.table("demo_requests")\
-                        .select("id", count="exact")\
-                        .eq("ip_address", ip_address)\
-                        .gt("request_time", start_time)\
+                    result = (
+                        self._supabase._client.table("demo_requests")
+                        .select("id", count="exact")
+                        .eq("ip_address", ip_address)
+                        .gt("request_time", start_time)
                         .execute()
+                    )
                     count = result.count or 0
-                    
+
                     # Update cache with a single timestamp to represent historical count
                     if count > 0:
                         self._demo_cache[ip_address].extend([now - 3600] * count)
                 except Exception as e:
-                    logger.error(f"Failed to get demo request count for IP {ip_address}: {e}")
-            
+                    logger.error(
+                        f"Failed to get demo request count for IP {ip_address}: {e}"
+                    )
+
             return count
 
-    async def validate_demo_request(self, ip_address: str, text_length: int) -> Tuple[bool, Optional[str]]:
+    async def validate_demo_request(
+        self, ip_address: str, text_length: int
+    ) -> Tuple[bool, Optional[str]]:
         """Validate a demo request based on IP and text length limits."""
         try:
             # Check text length limit first (fastest check)
             if text_length > settings.demo_max_characters:
-                return False, f"Text length exceeds demo limit of {settings.demo_max_characters} characters"
+                return (
+                    False,
+                    f"Text length exceeds demo limit of {settings.demo_max_characters} characters",
+                )
 
             # Check daily request limit using cache-first approach
             count = await self.get_demo_request_count(ip_address)
@@ -211,7 +222,7 @@ class UsageTrackingService:
     async def track_demo_request(self, ip_address: str) -> bool:
         """Track a demo request by updating cache and asynchronously updating database."""
         now = time.time()
-        
+
         try:
             # Update cache immediately
             async with self._cache_lock:
@@ -220,7 +231,7 @@ class UsageTrackingService:
             # Asynchronously update database without waiting
             if self._supabase._client:
                 asyncio.create_task(self._async_track_demo_request(ip_address))
-            
+
             return True
         except Exception as e:
             logger.error(f"Failed to track demo request for IP {ip_address}: {e}")
@@ -229,12 +240,16 @@ class UsageTrackingService:
     async def _async_track_demo_request(self, ip_address: str):
         """Asynchronously update database with demo request."""
         try:
-            await self._supabase._client.table("demo_requests")\
-                .insert({
-                    "ip_address": ip_address,
-                    "request_time": datetime.utcnow().isoformat()
-                })\
+            await (
+                self._supabase._client.table("demo_requests")
+                .insert(
+                    {
+                        "ip_address": ip_address,
+                        "request_time": datetime.utcnow().isoformat(),
+                    }
+                )
                 .execute()
+            )
         except Exception as e:
             logger.error(f"Failed to persist demo request for IP {ip_address}: {e}")
             # Don't raise exception as this is background task
