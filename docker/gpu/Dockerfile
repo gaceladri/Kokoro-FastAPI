@@ -55,14 +55,10 @@ ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     USE_GPU=true \
     DEVICE="gpu" \
-    # Default values for Supabase config (to be overridden)
-    SUPABASE_URL="" \
-    SUPABASE_KEY="" \
+    # Feature flags
     ENABLE_USAGE_TRACKING="true" \
-    # Stripe configuration (to be overridden)
-    STRIPE_SECRET_KEY=""
+    DOWNLOAD_MODEL=true
 
-ENV DOWNLOAD_MODEL=true
 # Download model if enabled
 RUN if [ "$DOWNLOAD_MODEL" = "true" ]; then \
     python download_model.py --output api/src/models/v1_0; \

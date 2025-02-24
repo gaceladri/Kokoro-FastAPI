@@ -1,4 +1,4 @@
-name: kokoro-tts-gpu
+name: kokoro-fastapi-gpu
 services:
   kokoro-tts:
     # image: ghcr.io/remsky/kokoro-fastapi-gpu:v0.2.0
@@ -7,12 +7,17 @@ services:
       dockerfile: docker/gpu/Dockerfile
     volumes:
       - ../../api:/app/api
+      # Mount config directory for environment variables
+      - ${CONFIG_DIR:-../../config}:/app/config
     ports:
       - "8880:8880"
     environment:
       - PYTHONPATH=/app:/app/api
       - USE_GPU=true
       - PYTHONUNBUFFERED=1
+      # Only set non-sensitive environment variables here
+      - ENABLE_USAGE_TRACKING=${ENABLE_USAGE_TRACKING:-true}
+      - DOWNLOAD_MODEL=${DOWNLOAD_MODEL:-true}
     deploy:
       resources:
         reservations:

@@ -20,6 +20,7 @@ Dockerized FastAPI wrapper for [Kokoro-82M](https://huggingface.co/hexgrad/Kokor
 - Phoneme-based audio generation, phoneme generation
 - Per-word timestamped caption generation
 - Voice mixing with weighted combinations
+- Usage tracking with Supabase and Stripe integration
 
 ### Integration Guides
  [![Helm Chart](https://img.shields.io/badge/Helm%20Chart-black?style=flat&logo=helm&logoColor=white)](https://github.com/remsky/Kokoro-FastAPI/wiki/Setup-Kubernetes) [![DigitalOcean](https://img.shields.io/badge/DigitalOcean-black?style=flat&logo=digitalocean&logoColor=white)](https://github.com/remsky/Kokoro-FastAPI/wiki/Integrations-DigitalOcean) [![SillyTavern](https://img.shields.io/badge/SillyTavern-black?style=flat&color=red)](https://github.com/remsky/Kokoro-FastAPI/wiki/Integrations-SillyTavern)
@@ -59,9 +60,18 @@ docker run --gpus all -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-gpu:v0.2.2  #NV
         git clone https://github.com/remsky/Kokoro-FastAPI.git
         cd Kokoro-FastAPI
 
+        # Set up environment variables securely
+        ./setup-env.sh
+        
+        # Run with the new script (automatically uses the right docker-compose file)
+        ./run-local.sh gpu  # For GPU support
+        # or
+        ./run-local.sh cpu  # For CPU support
+        
+        # Alternatively, use docker-compose directly
         cd docker/gpu  # For GPU support
         # or cd docker/cpu  # For CPU support
-        docker compose up --build
+        CONFIG_DIR=../../config docker compose up --build
 
         # Models will auto-download, but if needed you can manually download:
         python docker/scripts/download_model.py --output api/src/models/v1_0
@@ -83,12 +93,26 @@ docker run --gpus all -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-gpu:v0.2.2  #NV
         cd Kokoro-FastAPI
         ```
         
-        Run the [model download script](https://github.com/remsky/Kokoro-FastAPI/blob/master/docker/scripts/download_model.py) if you haven't already
-     
-        Start directly via UV (with hot-reload)
+        Set up your environment variables securely:
         ```bash
-        ./start-cpu.sh OR
-        ./start-gpu.sh 
+        # Set up secure environment configuration
+        ./setup-env.sh
+        
+        # Run locally with secure environment variables
+        ./run-local-dev.sh  # Uses GPU by default
+        
+        # Or run with CPU
+        USE_GPU=false ./run-local-dev.sh
+        ```
+        
+        Alternatively, you can run the model download script and start directly:
+        ```bash
+        # Download the model if you haven't already
+        python docker/scripts/download_model.py --output api/src/models/v1_0
+     
+        # Start directly via UV (with hot-reload)
+        ./start-cpu.sh  # For CPU support
+        ./start-gpu.sh  # For GPU support
         ```
 
 </details>
@@ -550,4 +574,60 @@ This project is licensed under the Apache License 2.0 - see below for details:
 - The inference code adapted from StyleTTS2 is MIT licensed
 
 The full Apache 2.0 license text can be found at: https://www.apache.org/licenses/LICENSE-2.0
+</details>
+
+## Environment Configuration
+
+<details>
+<summary>Secure Environment Variables Setup</summary>
+
+For features like usage tracking with Supabase and Stripe integration, you need to securely configure environment variables:
+
+1. **Create your environment file**:
+   ```bash
+   # Copy the example file
+   cp .env.example /path/to/your/config/.env
+   
+   # Edit with your secure values
+   nano /path/to/your/config/.env
+   ```
+
+2. **Mount the config directory** when running with Docker:
+   ```bash
+   docker run -p 8880:8880 \
+     -v /path/to/your/config:/app/config \
+     ghcr.io/remsky/kokoro-fastapi-cpu:v0.2.2
+   ```
+
+3. **With docker-compose**:
+   ```yaml
+   services:
+     kokoro-api:
+       image: ghcr.io/remsky/kokoro-fastapi-gpu:v0.2.2
+       volumes:
+         - /path/to/your/config:/app/config
+       ports:
+         - "8880:8880"
+       deploy:
+         resources:
+           reservations:
+             devices:
+               - driver: nvidia
+                 count: 1
+                 capabilities: [gpu]
+   ```
+
+4. **Required variables for usage tracking**:
+   - `SUPABASE_URL`: Your Supabase project URL
+   - `SUPABASE_KEY`: Your Supabase service key
+   - `STRIPE_SECRET_KEY`: Your Stripe secret key
+   - `ENABLE_USAGE_TRACKING`: Set to "true" to enable tracking
+
+5. **Security best practices**:
+   - Never commit .env files to version control
+   - Use Docker secrets in production environments
+   - Set appropriate file permissions (chmod 600) on your .env file
+   - Consider using a secrets manager for production deployments
+
+For more detailed information on secure deployment in production environments, see the [Secure Deployment Guide](docs/secure-deployment.md).
 </details>

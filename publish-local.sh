@@ -35,8 +35,27 @@ fi
 echo "Switching to multi-platform builder..."
 docker buildx use multiplatform-builder
 
+# Security warning for sensitive environment variables
+echo "⚠️  SECURITY WARNING ⚠️"
+echo "This build process will create Docker images without sensitive environment variables."
+echo "For production use, you should mount a config directory with your .env file:"
+echo "  - Use './setup-env.sh' to create your secure environment configuration"
+echo "  - Mount the config directory when running containers"
+echo "  - See README.md for detailed instructions on secure environment setup"
+echo ""
+
 # Build and push images
 echo "Building and pushing images..."
 docker buildx bake "$TARGET" --push
 
-echo "Images built and pushed successfully!" 
+# Check for warnings about sensitive environment variables
+if docker buildx bake "$TARGET" --print | grep -q "SUPABASE_KEY\|STRIPE_SECRET_KEY"; then
+    echo "⚠️  WARNING: Sensitive environment variables detected in Dockerfile!"
+    echo "Please remove any sensitive variables from the Dockerfile and use mounted config instead."
+fi
+
+echo "Images built and pushed successfully!"
+echo ""
+echo "To run the container with secure environment variables:"
+echo "  1. Set up your environment: ./setup-env.sh"
+echo "  2. Run with config mount: docker run -p 8880:8880 -v ./config:/app/config gaceladri/kokoro-fastapi-gpu:$VERSION" 
