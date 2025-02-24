@@ -219,7 +219,7 @@ class UsageTrackingService:
             logger.error(f"Failed to validate demo request for IP {ip_address}: {e}")
             return False, "Internal server error"
 
-    async def track_demo_request(self, ip_address: str) -> bool:
+    async def track_demo_request(self, ip_address: str, character_count: int) -> bool:
         """Track a demo request by updating cache and asynchronously updating database."""
         now = time.time()
 
@@ -230,20 +230,21 @@ class UsageTrackingService:
 
             # Asynchronously update database without waiting
             if self._supabase._client:
-                asyncio.create_task(self._async_track_demo_request(ip_address))
+                asyncio.create_task(self._async_track_demo_request(ip_address, character_count))
 
             return True
         except Exception as e:
             logger.error(f"Failed to track demo request for IP {ip_address}: {e}")
             return False
 
-    async def _async_track_demo_request(self, ip_address: str):
+    async def _async_track_demo_request(self, ip_address: str, character_count: int):
         """Asynchronously update database with demo request."""
         try:
             data = await self._supabase._client.table("demo_requests").insert(
                 {
                     "ip_address": ip_address,
                     "request_time": datetime.utcnow().isoformat(),
+                    "character_count": character_count,
                 }
             ).execute()
         except Exception as e:
@@ -252,8 +253,57 @@ class UsageTrackingService:
             logger.error(
                 f"Failed to persist demo request:\n"
                 f"IP: {ip_address}\n"
+                f"Character Count: {character_count}\n"
                 f"Error Type: {error_type}\n"
                 f"Error Details: {error_details}\n"
                 f"Timestamp: {datetime.utcnow().isoformat()}"
             )
             # Don't raise exception as this is background task
+
+    async def get_demo_usage_stats(self, ip_address: str) -> Dict:
+        """Get demo usage statistics for an IP address in the last 24 hours.
+
+        Args:
+            ip_address: IP address to get stats for
+
+        Returns:
+            Dict containing usage statistics
+        """
+        try:
+            # Get request count
+            request_count = await self.get_demo_request_count(ip_address)
+
+            # Get character count from database
+            if self._supabase._client:
+                start_time = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+                result = (
+                    self._supabase._client.table("demo_requests")
+                    .select("character_count")
+                    .eq("ip_address", ip_address)
+                    .gt("request_time", start_time)
+                    .execute()
+                )
+                
+                total_characters = sum(row.get("character_count", 0) for row in result.data)
+            else:
+                total_characters = 0
+
+            return {
+                "total_requests": request_count,
+                "total_characters": total_characters,
+                "requests_remaining": settings.demo_daily_limit - request_count,
+                "characters_remaining": settings.demo_max_characters,  # Per request limit
+                "period_start": (datetime.utcnow() - timedelta(hours=24)).isoformat(),
+                "period_end": datetime.utcnow().isoformat(),
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to get demo usage stats for IP {ip_address}: {e}")
+            return {
+                "total_requests": 0,
+                "total_characters": 0,
+                "requests_remaining": settings.demo_daily_limit,
+                "characters_remaining": settings.demo_max_characters,
+                "period_start": (datetime.utcnow() - timedelta(hours=24)).isoformat(),
+                "period_end": datetime.utcnow().isoformat(),
+            }

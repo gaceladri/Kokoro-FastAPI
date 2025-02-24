@@ -170,7 +170,10 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                 usage_service = await self._get_usage_service()
                 if getattr(request.state, "is_demo", False):
                     asyncio.create_task(
-                        usage_service.track_demo_request(request.state.ip_address)
+                        usage_service.track_demo_request(
+                            request.state.ip_address,
+                            text_length
+                        )
                     )
                 else:
                     subscription = request_info["subscription"]
