@@ -56,7 +56,7 @@ ingress:
   #      - chart-example.local
 
 kokoroTTS:
-  repository: "ghcr.io/remsky/kokoro-fastapi-gpu"
+  repository: "docker.io/gaceladri/kokoro-fastapi-gpu"
   tag: "latest"
   pullPolicy: Always
   serviceName: "fastapi"
