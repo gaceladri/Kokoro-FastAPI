@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 from typing import AsyncGenerator, Dict, List, Union
+from datetime import datetime, timedelta
 
 import aiofiles
 import torch
@@ -203,6 +204,86 @@ async def create_speech(
         tts_service = await get_tts_service()
         voice_name = await process_voices(request.voice, tts_service)
 
+        # Check usage limits if tracking is enabled
+        if settings.enable_usage_tracking:
+            usage_service = await get_usage_service()
+            
+            # Get request type from request state (set by middleware)
+            request_type = getattr(client_request.state, "request_type", None)
+            
+            # If request type is not set, determine it based on headers
+            if not request_type:
+                api_key = client_request.headers.get("X-API-Key")
+                user_id = client_request.headers.get("X-User-ID")
+                
+                if api_key:
+                    request_type = "paid"
+                elif user_id:
+                    request_type = "free"
+                else:
+                    request_type = "demo"
+            
+            # Validate based on request type
+            if request_type == "paid":
+                # Paid tier validation
+                api_key_prefix = getattr(client_request.state, "api_key_prefix", None)
+                if not api_key_prefix:
+                    api_key = client_request.headers.get("X-API-Key", "")
+                    api_key_prefix = api_key[:8] if api_key else None
+                
+                if not api_key_prefix:
+                    raise HTTPException(
+                        status_code=401,
+                        detail={
+                            "error": "missing_api_key",
+                            "message": "API key is required",
+                            "type": "authentication_error",
+                        },
+                    )
+                
+                is_valid, error_msg, context = await usage_service.validate_request(
+                    api_key_prefix, len(request.input)
+                )
+            elif request_type == "free":
+                # Free tier validation
+                user_id = getattr(client_request.state, "user", {}).get("id")
+                if not user_id:
+                    user_id = client_request.headers.get("X-User-ID")
+                
+                if not user_id:
+                    raise HTTPException(
+                        status_code=401,
+                        detail={
+                            "error": "missing_user_id",
+                            "message": "User ID is required for free tier",
+                            "type": "authentication_error",
+                        },
+                    )
+                
+                is_valid, error_msg, context = await usage_service.validate_free_tier_request(
+                    user_id, len(request.input)
+                )
+            else:
+                # Demo request validation (IP-based)
+                client_ip = getattr(client_request.state, "ip_address", None)
+                if not client_ip:
+                    client_ip = client_request.client.host
+                
+                is_valid, error_msg = await usage_service.validate_demo_request(
+                    client_ip, len(request.input)
+                )
+                context = None
+            
+            if not is_valid:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": "usage_limit_exceeded",
+                        "message": error_msg or "Usage limit exceeded",
+                        "type": "usage_error",
+                    },
+                )
+
         # Set content type based on format
         content_type = {
             "mp3": "audio/mpeg",
@@ -260,21 +341,21 @@ async def create_speech(
                             await temp_writer.__aexit__(None, None, None)
 
                 # Stream with temp file writing
-                return StreamingResponse(
+                response = StreamingResponse(
                     dual_output(), media_type=content_type, headers=headers
                 )
-
-            # Standard streaming without download link
-            return StreamingResponse(
-                generator,
-                media_type=content_type,
-                headers={
-                    "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
-                    "X-Accel-Buffering": "no",
-                    "Cache-Control": "no-cache",
-                    "Transfer-Encoding": "chunked",
-                },
-            )
+            else:
+                # Standard streaming without download link
+                response = StreamingResponse(
+                    generator,
+                    media_type=content_type,
+                    headers={
+                        "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
+                        "X-Accel-Buffering": "no",
+                        "Cache-Control": "no-cache",
+                        "Transfer-Encoding": "chunked",
+                    },
+                )
         else:
             # Generate complete audio using public interface
             audio, _ = await tts_service.generate_audio(
@@ -293,7 +374,7 @@ async def create_speech(
                 is_last_chunk=True,
             )
 
-            return Response(
+            response = Response(
                 content=content,
                 media_type=content_type,
                 headers={
@@ -301,6 +382,76 @@ async def create_speech(
                     "Cache-Control": "no-cache",  # Prevent caching
                 },
             )
+
+        # Track usage after successful generation
+        if settings.enable_usage_tracking:
+            try:
+                # Get request type from request state
+                request_type = getattr(client_request.state, "request_type", None)
+                
+                # If request type is not set, determine it based on headers
+                if not request_type:
+                    api_key = client_request.headers.get("X-API-Key")
+                    user_id = client_request.headers.get("X-User-ID")
+                    
+                    if api_key:
+                        request_type = "paid"
+                    elif user_id:
+                        request_type = "free"
+                    else:
+                        request_type = "demo"
+                
+                # Track usage based on request type
+                if request_type == "paid":
+                    # Paid tier tracking
+                    subscription = getattr(client_request.state, "subscription", None)
+                    if not subscription:
+                        # If subscription not in state, we can't track usage
+                        logger.warning("Cannot track paid usage: subscription not in request state")
+                    else:
+                        await usage_service.track_request(
+                            subscription_id=subscription["id"],
+                            period_start=datetime.fromisoformat(subscription["current_period_start"]),
+                            period_end=datetime.fromisoformat(subscription["current_period_end"]),
+                            character_count=len(request.input),
+                        )
+                elif request_type == "free":
+                    # Free tier tracking
+                    user_id = getattr(client_request.state, "user", {}).get("id")
+                    if not user_id:
+                        user_id = client_request.headers.get("X-User-ID")
+                    
+                    if not user_id:
+                        logger.warning("Cannot track free tier usage: user ID not available")
+                    else:
+                        now = datetime.utcnow()
+                        period_start = datetime(now.year, now.month, 1)
+                        if now.month < 12:
+                            period_end = datetime(now.year, now.month + 1, 1) - timedelta(seconds=1)
+                        else:
+                            period_end = datetime(now.year + 1, 1, 1) - timedelta(seconds=1)
+                        
+                        await usage_service.track_free_tier_usage(
+                            user_id=user_id,
+                            period_start=period_start,
+                            period_end=period_end,
+                            character_count=len(request.input),
+                        )
+                else:
+                    # Demo request tracking
+                    client_ip = getattr(client_request.state, "ip_address", None)
+                    if not client_ip:
+                        client_ip = client_request.client.host
+                    
+                    await usage_service.track_demo_request(
+                        ip_address=client_ip,
+                        character_count=len(request.input),
+                    )
+            except Exception as e:
+                # Log but don't fail the request if tracking fails
+                logger.error(f"Failed to track usage: {e}")
+
+        return response
 
     except ValueError as e:
         # Handle validation errors
@@ -593,49 +744,108 @@ async def combine_voices(request: Union[str, List[str]]):
 @router.get("/usage")
 async def get_usage_stats(
     request: Request,
+    usage_service: UsageTrackingService = Depends(get_usage_service),
 ):
-    """Get usage statistics for the current subscription period."""
+    """Get usage statistics for the current user."""
     try:
-        # Get subscription info from request state (set by middleware)
-        subscription = request.state.subscription
-        if not subscription:
+        if not settings.enable_usage_tracking:
             raise HTTPException(
-                status_code=403,
+                status_code=400,
                 detail={
-                    "error": "no_subscription",
-                    "message": "No active subscription found",
-                    "type": "authorization_error",
+                    "error": "usage_tracking_disabled",
+                    "message": "Usage tracking is not enabled",
+                    "type": "invalid_request_error",
                 },
             )
 
-        # Return current usage and limits
-        product = subscription["products"]
-        current_usage = (
-            request.state.usage["total_requests"] if request.state.usage else 0
-        )
-        current_characters = (
-            request.state.usage.get("total_characters", 0) if request.state.usage else 0
-        )
-
-        return {
-            "subscription_id": subscription["id"],
-            "period_start": subscription["current_period_start"],
-            "period_end": subscription["current_period_end"],
-            "total_requests": current_usage,
-            "total_characters": current_characters,
-            "request_limit": product["monthly_request_limit"],
-            "character_limit": product.get("monthly_character_limit"),
-            "requests_remaining": (
-                product["monthly_request_limit"] - current_usage
-                if product["monthly_request_limit"] is not None
-                else None
-            ),
-            "characters_remaining": (
-                product["monthly_character_limit"] - current_characters
-                if product.get("monthly_character_limit") is not None
-                else None
-            ),
-        }
+        # Get request type from request state (set by middleware)
+        request_type = getattr(request.state, "request_type", None)
+        
+        # If request type is not set, determine it based on headers
+        if not request_type:
+            api_key = request.headers.get("X-API-Key")
+            user_id = request.headers.get("X-User-ID")
+            
+            if api_key:
+                request_type = "paid"
+            elif user_id:
+                request_type = "free"
+            else:
+                request_type = "demo"
+        
+        # Get usage statistics based on request type
+        if request_type == "paid":
+            # Paid tier statistics
+            user_info = getattr(request.state, "user", None)
+            if not user_info:
+                # Try to get user info from API key
+                api_key = request.headers.get("X-API-Key", "")
+                api_key_prefix = api_key[:8] if api_key else None
+                
+                if not api_key_prefix:
+                    raise HTTPException(
+                        status_code=401,
+                        detail={
+                            "error": "missing_api_key",
+                            "message": "API key is required",
+                            "type": "authentication_error",
+                        },
+                    )
+                
+                # Validate API key to get user info
+                is_valid, _, request_info = await usage_service._validate_api_key(api_key)
+                if not is_valid or not request_info:
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "error": "invalid_api_key",
+                            "message": "Invalid API key",
+                            "type": "authentication_error",
+                        },
+                    )
+                
+                user_info = request_info["user"]
+            
+            # Get user statistics
+            user_id = user_info["id"]
+            stats = await usage_service.get_user_statistics(user_id)
+        elif request_type == "free":
+            # Free tier statistics
+            user_id = getattr(request.state, "user", {}).get("id")
+            if not user_id:
+                user_id = request.headers.get("X-User-ID")
+            
+            if not user_id:
+                raise HTTPException(
+                    status_code=401,
+                    detail={
+                        "error": "missing_user_id",
+                        "message": "User ID is required for free tier",
+                        "type": "authentication_error",
+                    },
+                )
+            
+            # Get user statistics
+            stats = await usage_service.get_user_statistics(user_id)
+        else:
+            # Demo statistics (IP-based)
+            client_ip = getattr(request.state, "ip_address", None)
+            if not client_ip:
+                client_ip = request.client.host
+            
+            stats = await usage_service.get_demo_usage_stats(client_ip)
+        
+        if stats is None:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "usage_stats_error",
+                    "message": "Failed to retrieve usage statistics",
+                    "type": "server_error",
+                },
+            )
+            
+        return stats
 
     except HTTPException:
         raise

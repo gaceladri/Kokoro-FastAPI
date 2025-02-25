@@ -92,23 +92,38 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
         try:
             # Get API key and text length concurrently
             api_key = request.headers.get("X-API-Key")
+            user_id = request.headers.get("X-User-ID")  # Add user ID header for free tier
             text_length_task = asyncio.create_task(self._get_text_length(request))
 
-            # Handle demo request for speech endpoint
-            if request.url.path == "/v1/audio/speech" and not api_key:
-                text_length = await text_length_task
-                if text_length is None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={
-                            "error": "invalid_request",
-                            "message": "Unable to determine text length",
-                            "type": "validation_error",
-                        },
-                    )
+            # Determine request type based on headers
+            if api_key:
+                # Paid tier with API key
+                request_type = "paid"
+            elif user_id:
+                # Free tier with user ID
+                request_type = "free"
+            else:
+                # Demo request (no auth)
+                request_type = "demo"
 
-                # Validate demo request
-                usage_service = await self._get_usage_service()
+            # Get text length for all request types
+            text_length = await text_length_task
+            if text_length is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "invalid_request",
+                        "message": "Unable to determine text length",
+                        "type": "validation_error",
+                    },
+                )
+
+            # Get usage service
+            usage_service = await self._get_usage_service()
+
+            # Handle request based on type
+            if request_type == "demo":
+                # Demo request (no auth)
                 ip_address = self.get_client_ip(request)
                 is_allowed, message = await usage_service.validate_demo_request(
                     ip_address, text_length
@@ -125,11 +140,33 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                     )
 
                 # Set demo state
-                request.state.is_demo = True
+                request.state.request_type = "demo"
                 request.state.text_length = text_length
                 request.state.ip_address = ip_address
+            elif request_type == "free":
+                # Free tier with user ID
+                is_valid, error_message, context = await usage_service.validate_free_tier_request(
+                    user_id, text_length
+                )
+                
+                if not is_valid:
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "error": "free_tier_limit_exceeded",
+                            "message": error_message,
+                            "type": "authorization_error",
+                        },
+                    )
+                
+                # Set free tier state
+                request.state.request_type = "free"
+                request.state.user = {"id": user_id}
+                request.state.text_length = text_length
+                request.state.free_tier_context = context
+                request.state.api_key_prefix = None
             else:
-                # Handle authenticated request
+                # Paid tier with API key
                 if not api_key:
                     raise HTTPException(
                         status_code=401,
@@ -144,7 +181,6 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                 is_valid, error_message, request_info = await self._validate_api_key(
                     api_key
                 )
-                text_length = await text_length_task
 
                 if not is_valid:
                     raise HTTPException(
@@ -157,26 +193,42 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                     )
 
                 # Set request state
+                request.state.request_type = "paid"
                 request.state.user = request_info["user"]
                 request.state.subscription = request_info["subscription"]
                 request.state.usage = request_info["usage"]
                 request.state.text_length = text_length
+                request.state.api_key_prefix = api_key[:8]
 
             # Process request
             response = await call_next(request)
 
             # Asynchronously track successful requests
             if response.status_code == 200 and text_length is not None:
-                usage_service = await self._get_usage_service()
-                if getattr(request.state, "is_demo", False):
+                request_type = getattr(request.state, "request_type", None)
+                
+                if request_type == "demo":
+                    # Track demo request
                     asyncio.create_task(
                         usage_service.track_demo_request(
                             request.state.ip_address,
                             text_length
                         )
                     )
-                else:
-                    subscription = request_info["subscription"]
+                elif request_type == "free":
+                    # Track free tier request
+                    context = request.state.free_tier_context
+                    asyncio.create_task(
+                        usage_service.track_free_tier_usage(
+                            user_id=request.state.user["id"],
+                            period_start=context["period_start"],
+                            period_end=context["period_end"],
+                            character_count=text_length,
+                        )
+                    )
+                elif request_type == "paid":
+                    # Track paid subscription request
+                    subscription = request.state.subscription
                     asyncio.create_task(
                         usage_service.track_request(
                             subscription_id=subscription["id"],

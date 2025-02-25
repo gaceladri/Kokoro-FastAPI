@@ -93,6 +93,57 @@ class UsageTrackingService:
             logger.error(f"Failed to validate request: {e}")
             return False, "Internal server error", None
 
+    async def validate_free_tier_request(
+        self,
+        user_id: str,
+        text_length: Optional[int] = None,
+    ) -> Tuple[bool, Optional[str], Optional[Dict]]:
+        """Validate a request for a free tier user."""
+        if not settings.enable_usage_tracking:
+            return True, None, None
+
+        try:
+            # Get current month's boundaries
+            now = datetime.utcnow()
+            period_start = datetime(now.year, now.month, 1)
+            if now.month < 12:
+                period_end = datetime(now.year, now.month + 1, 1) - timedelta(seconds=1)
+            else:
+                period_end = datetime(now.year + 1, 1, 1) - timedelta(seconds=1)
+
+            # Get free tier usage
+            usage = await self._supabase.get_free_tier_usage(
+                user_id, period_start, period_end
+            )
+
+            # Check usage limits
+            current_characters = usage.get("total_requests", 0) if usage else 0
+            free_tier_limit = settings.free_tier_character_limit
+
+            if text_length is not None and (
+                current_characters + text_length > free_tier_limit
+            ):
+                return (
+                    False,
+                    f"Free tier character limit would be exceeded (limit: {free_tier_limit})",
+                    None,
+                )
+
+            return (
+                True,
+                None,
+                {
+                    "user_id": user_id,
+                    "usage": usage,
+                    "period_start": period_start,
+                    "period_end": period_end,
+                },
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to validate free tier request: {e}")
+            return False, "Internal server error", None
+
     async def track_request(
         self,
         subscription_id: str,
@@ -131,6 +182,30 @@ class UsageTrackingService:
             logger.error(f"Failed to track request: {e}")
             return False
 
+    async def track_free_tier_usage(
+        self,
+        user_id: str,
+        period_start: datetime,
+        period_end: datetime,
+        character_count: int,
+    ) -> bool:
+        """Track usage for a free tier user."""
+        if not settings.enable_usage_tracking:
+            return True
+
+        try:
+            # Update Supabase
+            await self._supabase.track_free_tier_usage(
+                user_id=user_id,
+                period_start=period_start,
+                period_end=period_end,
+                character_count=character_count,
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to track free tier usage: {e}")
+            return False
+
     async def get_subscription_usage(
         self, subscription_id: str, period_start: datetime, period_end: datetime
     ) -> Optional[Dict]:
@@ -144,6 +219,21 @@ class UsageTrackingService:
             )
         except Exception as e:
             logger.error(f"Failed to get subscription usage: {e}")
+            return None
+
+    async def get_free_tier_usage(
+        self, user_id: str, period_start: datetime, period_end: datetime
+    ) -> Optional[Dict]:
+        """Get usage statistics for a free tier user."""
+        if not settings.enable_usage_tracking:
+            return {"total_requests": 0}
+
+        try:
+            return await self._supabase.get_free_tier_usage(
+                user_id, period_start, period_end
+            )
+        except Exception as e:
+            logger.error(f"Failed to get free tier usage: {e}")
             return None
 
     async def _cleanup_demo_cache(self):
@@ -228,37 +318,34 @@ class UsageTrackingService:
             async with self._cache_lock:
                 self._demo_cache[ip_address].append(now)
 
+            # Get the current month's boundaries for tracking
+            now_dt = datetime.utcnow()
+            period_start = datetime(now_dt.year, now_dt.month, 1)
+            if now_dt.month < 12:
+                period_end = datetime(now_dt.year, now_dt.month + 1, 1) - timedelta(
+                    seconds=1
+                )
+            else:
+                period_end = datetime(now_dt.year + 1, 1, 1) - timedelta(seconds=1)
+
             # Asynchronously update database without waiting
             if self._supabase._client:
-                asyncio.create_task(self._async_track_demo_request(ip_address, character_count))
+                # Also track in free_usage table with a special user ID for demo users
+                # This allows us to treat demo usage as part of the free tier
+                demo_user_id = f"demo:{ip_address}"
+                asyncio.create_task(
+                    self.track_free_tier_usage(
+                        user_id=demo_user_id,
+                        period_start=period_start,
+                        period_end=period_end,
+                        character_count=character_count,
+                    )
+                )
 
             return True
         except Exception as e:
             logger.error(f"Failed to track demo request for IP {ip_address}: {e}")
             return False
-
-    async def _async_track_demo_request(self, ip_address: str, character_count: int):
-        """Asynchronously update database with demo request."""
-        try:
-            data = await self._supabase._client.table("demo_requests").insert(
-                {
-                    "ip_address": ip_address,
-                    "request_time": datetime.utcnow().isoformat(),
-                    "character_count": character_count,
-                }
-            ).execute()
-        except Exception as e:
-            error_type = type(e).__name__
-            error_details = str(e)
-            logger.error(
-                f"Failed to persist demo request:\n"
-                f"IP: {ip_address}\n"
-                f"Character Count: {character_count}\n"
-                f"Error Type: {error_type}\n"
-                f"Error Details: {error_details}\n"
-                f"Timestamp: {datetime.utcnow().isoformat()}"
-            )
-            # Don't raise exception as this is background task
 
     async def get_demo_usage_stats(self, ip_address: str) -> Dict:
         """Get demo usage statistics for an IP address in the last 24 hours.
@@ -270,7 +357,7 @@ class UsageTrackingService:
             Dict containing usage statistics
         """
         try:
-            # Get request count
+            # Get request count for the last 24 hours
             request_count = await self.get_demo_request_count(ip_address)
 
             # Get character count from database
@@ -283,16 +370,36 @@ class UsageTrackingService:
                     .gt("request_time", start_time)
                     .execute()
                 )
-                
-                total_characters = sum(row.get("character_count", 0) for row in result.data)
+
+                total_characters = sum(
+                    row.get("character_count", 0) for row in result.data
+                )
             else:
                 total_characters = 0
 
+            # Also get monthly usage from free_usage table
+            demo_user_id = f"demo:{ip_address}"
+            now = datetime.utcnow()
+            period_start = datetime(now.year, now.month, 1)
+
+            monthly_usage = await self.get_free_tier_usage(
+                demo_user_id, period_start, None
+            )
+
+            monthly_characters = (
+                monthly_usage.get("total_requests", 0) if monthly_usage else 0
+            )
+
             return {
-                "total_requests": request_count,
-                "total_characters": total_characters,
+                "tier": "demo",
+                "total_requests": request_count,  # Last 24 hours
+                "total_characters": total_characters,  # Last 24 hours
+                "monthly_characters": monthly_characters,  # Current month
                 "requests_remaining": settings.demo_daily_limit - request_count,
                 "characters_remaining": settings.demo_max_characters,  # Per request limit
+                "monthly_limit": settings.free_tier_character_limit,
+                "monthly_remaining": settings.free_tier_character_limit
+                - monthly_characters,
                 "period_start": (datetime.utcnow() - timedelta(hours=24)).isoformat(),
                 "period_end": datetime.utcnow().isoformat(),
             }
@@ -300,10 +407,96 @@ class UsageTrackingService:
         except Exception as e:
             logger.error(f"Failed to get demo usage stats for IP {ip_address}: {e}")
             return {
+                "tier": "demo",
                 "total_requests": 0,
                 "total_characters": 0,
+                "monthly_characters": 0,
                 "requests_remaining": settings.demo_daily_limit,
                 "characters_remaining": settings.demo_max_characters,
+                "monthly_limit": settings.free_tier_character_limit,
+                "monthly_remaining": settings.free_tier_character_limit,
                 "period_start": (datetime.utcnow() - timedelta(hours=24)).isoformat(),
                 "period_end": datetime.utcnow().isoformat(),
             }
+
+    async def get_user_statistics(self, user_id: str) -> Optional[Dict]:
+        """Get usage statistics for a user, handling both free and paid tiers.
+
+        Args:
+            user_id: User identifier
+
+        Returns:
+            Dict containing usage statistics
+        """
+        try:
+            # Check if user has an active subscription
+            subscription = await self._supabase.get_active_subscription(user_id)
+
+            if subscription:
+                # Paid tier statistics
+                period_start = datetime.fromisoformat(
+                    subscription["current_period_start"]
+                )
+                period_end = datetime.fromisoformat(subscription["current_period_end"])
+
+                usage = await self.get_subscription_usage(
+                    subscription["id"], period_start, period_end
+                )
+
+                product = subscription["products"]
+
+                return {
+                    "tier": "paid",
+                    "subscription_id": subscription["id"],
+                    "period_start": subscription["current_period_start"],
+                    "period_end": subscription["current_period_end"],
+                    "total_requests": usage.get("total_requests", 0) if usage else 0,
+                    "total_characters": usage.get("total_characters", 0)
+                    if usage
+                    else 0,
+                    "request_limit": product["monthly_request_limit"],
+                    "character_limit": product.get("monthly_character_limit"),
+                    "requests_remaining": (
+                        product["monthly_request_limit"]
+                        - usage.get("total_requests", 0)
+                        if product["monthly_request_limit"] is not None and usage
+                        else None
+                    ),
+                    "characters_remaining": (
+                        product.get("monthly_character_limit")
+                        - usage.get("total_characters", 0)
+                        if product.get("monthly_character_limit") is not None and usage
+                        else None
+                    ),
+                }
+            else:
+                # Free tier statistics
+                now = datetime.utcnow()
+                period_start = datetime(now.year, now.month, 1)
+                if now.month < 12:
+                    period_end = datetime(now.year, now.month + 1, 1) - timedelta(
+                        seconds=1
+                    )
+                else:
+                    period_end = datetime(now.year + 1, 1, 1) - timedelta(seconds=1)
+
+                usage = await self.get_free_tier_usage(
+                    user_id, period_start, period_end
+                )
+
+                current_usage = usage.get("total_requests", 0) if usage else 0
+
+                return {
+                    "tier": "free",
+                    "user_id": user_id,
+                    "period_start": period_start.isoformat(),
+                    "period_end": period_end.isoformat(),
+                    "total_requests": current_usage,
+                    "request_limit": settings.free_tier_character_limit,
+                    "requests_remaining": settings.free_tier_character_limit
+                    - current_usage,
+                }
+
+        except Exception as e:
+            logger.error(f"Failed to get user statistics: {e}")
+            return None

@@ -170,20 +170,107 @@ async def get_usage_stats(
             },
         )
 
-    user_id = getattr(request.state, "user_id", "anonymous")
-    stats = await usage_service.get_user_statistics(user_id)
-
-    if stats is None:
+    try:
+        # Get request type from request state (set by middleware)
+        request_type = getattr(request.state, "request_type", None)
+        
+        # If request type is not set, determine it based on headers
+        if not request_type:
+            api_key = request.headers.get("X-API-Key")
+            user_id = request.headers.get("X-User-ID")
+            
+            if api_key:
+                request_type = "paid"
+            elif user_id:
+                request_type = "free"
+            else:
+                request_type = "demo"
+        
+        # Get usage statistics based on request type
+        if request_type == "paid":
+            # Paid tier statistics
+            user_info = getattr(request.state, "user", None)
+            if not user_info:
+                # Try to get user info from API key
+                api_key = request.headers.get("X-API-Key", "")
+                api_key_prefix = api_key[:8] if api_key else None
+                
+                if not api_key_prefix:
+                    raise HTTPException(
+                        status_code=401,
+                        detail={
+                            "error": "missing_api_key",
+                            "message": "API key is required",
+                            "type": "authentication_error",
+                        },
+                    )
+                
+                # Validate API key to get user info
+                is_valid, _, request_info = await usage_service._validate_api_key(api_key)
+                if not is_valid or not request_info:
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "error": "invalid_api_key",
+                            "message": "Invalid API key",
+                            "type": "authentication_error",
+                        },
+                    )
+                
+                user_info = request_info["user"]
+            
+            # Get user statistics
+            user_id = user_info["id"]
+            stats = await usage_service.get_user_statistics(user_id)
+        elif request_type == "free":
+            # Free tier statistics
+            user_id = getattr(request.state, "user", {}).get("id")
+            if not user_id:
+                user_id = request.headers.get("X-User-ID")
+            
+            if not user_id:
+                raise HTTPException(
+                    status_code=401,
+                    detail={
+                        "error": "missing_user_id",
+                        "message": "User ID is required for free tier",
+                        "type": "authentication_error",
+                    },
+                )
+            
+            # Get user statistics
+            stats = await usage_service.get_user_statistics(user_id)
+        else:
+            # Demo statistics (IP-based)
+            client_ip = getattr(request.state, "ip_address", None)
+            if not client_ip:
+                client_ip = request.client.host
+            
+            stats = await usage_service.get_demo_usage_stats(client_ip)
+        
+        if stats is None:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "usage_stats_error",
+                    "message": "Failed to retrieve usage statistics",
+                    "type": "server_error",
+                },
+            )
+            
+        return stats
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting usage stats: {e}")
         raise HTTPException(
             status_code=500,
             detail={
-                "error": "usage_stats_error",
+                "error": "server_error",
                 "message": "Failed to retrieve usage statistics",
                 "type": "server_error",
             },
         )
-
-    return stats
 
 
 if __name__ == "__main__":

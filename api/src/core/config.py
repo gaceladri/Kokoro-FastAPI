@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     demo_daily_limit: int = Field(
         default=100, description="Maximum demo requests per IP per day"
     )
+    
+    # Free tier configuration
+    free_tier_character_limit: int = Field(
+        default=10000, description="Monthly character limit for free tier users"
+    )
 
     # Cache Settings
     api_key_cache_ttl: int = Field(
