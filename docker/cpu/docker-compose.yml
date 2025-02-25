@@ -10,7 +10,7 @@ services:
       # Mount config directory for environment variables
       - ${CONFIG_DIR:-../../config}:/app/config
     ports:
-      - "8880:8880"
+      - "${PORT:-8880}:8880"
     environment:
       - PYTHONPATH=/app:/app/api
       - USE_GPU=false

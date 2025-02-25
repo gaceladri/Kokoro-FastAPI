@@ -5,12 +5,14 @@ services:
     build:
       context: ../..
       dockerfile: docker/gpu/Dockerfile
+      args:
+        - CUDA_VERSION=${CUDA_VERSION:-12.8.0}
     volumes:
       - ../../api:/app/api
       # Mount config directory for environment variables
       - ${CONFIG_DIR:-../../config}:/app/config
     ports:
-      - "8880:8880"
+      - "${PORT:-8880}:8880"
     environment:
       - PYTHONPATH=/app:/app/api
       - USE_GPU=true
