@@ -68,9 +68,5 @@ RUN if [ "$DOWNLOAD_MODEL" = "true" ]; then \
 # Create directory for environment file
 RUN mkdir -p /app/config
 
-# Copy entrypoint script that will handle environment variables
-COPY --chown=appuser:appuser docker/scripts/entrypoint.sh ./entrypoint.sh
-RUN chmod +x ./entrypoint.sh
-
 # Run FastAPI server through entrypoint.sh
 CMD ["./entrypoint.sh"]

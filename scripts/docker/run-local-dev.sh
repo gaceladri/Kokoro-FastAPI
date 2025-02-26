@@ -18,12 +18,14 @@ show_help() {
     echo "  -r, --rebuild        Rebuild Docker image"
     echo "  -d, --detached       Run in detached mode"
     echo "  --check-cuda         Check CUDA compatibility before running"
+    echo "  --no-tracking        Disable usage tracking"
     echo ""
     echo "Examples:"
     echo "  $0 --cpu             Run with CPU configuration"
     echo "  $0 --gpu --rebuild   Run with GPU and rebuild the image"
     echo "  $0 -d -p 8881        Run in detached mode on port 8881"
     echo "  $0 --cuda 11.8.0     Run with CUDA 11.8.0"
+    echo "  $0 --no-tracking     Run with usage tracking disabled"
     echo ""
 }
 
@@ -35,10 +37,11 @@ REBUILD="false"
 DETACHED="false"
 CUDA_VERSION="12.8.0"
 CHECK_CUDA="false"
+DISABLE_TRACKING="false"
 
 # Get the script's directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ROOT_DIR="$SCRIPT_DIR"
 SETUP_ENV_SCRIPT="$ROOT_DIR/scripts/setup-env.sh"
 CHECK_CUDA_SCRIPT="$SCRIPT_DIR/check-cuda.sh"
 
@@ -73,6 +76,10 @@ while [[ $# -gt 0 ]]; do
             CHECK_CUDA="true"
             shift
             ;;
+        --no-tracking)
+            DISABLE_TRACKING="true"
+            shift
+            ;;
         -r|--rebuild)
             REBUILD="true"
             shift
@@ -104,16 +111,39 @@ fi
 # Check if config directory exists
 if [ ! -d "$CONFIG_DIR" ]; then
     echo "Config directory $CONFIG_DIR does not exist."
-    echo "Running setup-env.sh to create it..."
-    "$SETUP_ENV_SCRIPT"
+    # echo "Running setup-env.sh to create it..."
+    # "$SETUP_ENV_SCRIPT"
 fi
 
-# Check if .env file exists in config directory
-if [ ! -f "$CONFIG_DIR/.env.example" ]; then
-    echo "No .env.example file found in $CONFIG_DIR."
+# Check for environment files
+ENV_FILE="$CONFIG_DIR/.env"
+ENV_EXAMPLE_FILE="$CONFIG_DIR/.env.example"
+
+# Make sure PWD is set correctly for Docker Compose
+export PWD="$(pwd)"
+
+# Check if either .env or .env.example exists
+if [ ! -f "$ENV_FILE" ] && [ ! -f "$ENV_EXAMPLE_FILE" ]; then
+    echo "No .env or .env.example file found in $CONFIG_DIR."
     echo "Please run $SETUP_ENV_SCRIPT first to create your environment configuration."
     exit 1
 fi
+
+# If .env doesn't exist but .env.example does, copy it
+if [ ! -f "$ENV_FILE" ] && [ -f "$ENV_EXAMPLE_FILE" ]; then
+    echo "No .env file found in $CONFIG_DIR, but .env.example exists."
+    echo "Copying .env.example to .env..."
+    cp "$ENV_EXAMPLE_FILE" "$ENV_FILE"
+    echo "Please edit $ENV_FILE with your configuration if needed."
+fi
+
+# Verify that we now have a .env file
+if [ ! -f "$ENV_FILE" ]; then
+    echo "Failed to create .env file. Please check permissions and try again."
+    exit 1
+fi
+
+echo "Using environment file: $ENV_FILE"
 
 # Determine which Docker Compose file to use based on USE_GPU
 if [ "$USE_GPU" = "true" ]; then
@@ -146,20 +176,53 @@ PORT=$PORT
 CUDA_VERSION=$CUDA_VERSION
 EOL
 
+# Check if SUPABASE credentials exist in the .env file
+SUPABASE_URL=$(grep -oP 'SUPABASE_URL=\K.*' "$ENV_FILE" 2>/dev/null || echo "")
+SUPABASE_KEY=$(grep -oP 'SUPABASE_KEY=\K.*' "$ENV_FILE" 2>/dev/null || echo "")
+
+# If --no-tracking flag is set or SUPABASE credentials are missing, disable usage tracking
+if [ "$DISABLE_TRACKING" = "true" ] || [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
+    if [ "$DISABLE_TRACKING" = "true" ]; then
+        echo "Usage tracking disabled by user request."
+    else
+        echo "Warning: SUPABASE_URL or SUPABASE_KEY not found in $ENV_FILE"
+        echo "Disabling usage tracking to avoid errors."
+    fi
+    echo "ENABLE_USAGE_TRACKING=false" >> "$ROOT_DIR/.docker-compose-env"
+else
+    # If credentials exist and tracking is not disabled, enable usage tracking
+    echo "ENABLE_USAGE_TRACKING=true" >> "$ROOT_DIR/.docker-compose-env"
+    echo "SUPABASE_URL=$SUPABASE_URL" >> "$ROOT_DIR/.docker-compose-env"
+    echo "SUPABASE_KEY=$SUPABASE_KEY" >> "$ROOT_DIR/.docker-compose-env"
+    
+    # Export these variables so Docker Compose can use them with ${PWD}
+    export SUPABASE_URL="$SUPABASE_URL"
+    export SUPABASE_KEY="$SUPABASE_KEY"
+    export CONFIG_DIR="$CONFIG_DIR"
+    export PWD="$(pwd)"
+fi
+
+# Add other environment variables from .env file
+echo "DOWNLOAD_MODEL=$(grep -oP 'DOWNLOAD_MODEL=\K.*' "$ENV_FILE" 2>/dev/null || echo "true")" >> "$ROOT_DIR/.docker-compose-env"
+
+# Display environment variables being used (without sensitive info)
+echo "Environment variables being used:"
+grep -v "SUPABASE_" "$ROOT_DIR/.docker-compose-env" || true
+
 # Build the image if requested
 if [ "$REBUILD" = "true" ]; then
     echo "Rebuilding Docker image with CUDA $CUDA_VERSION..."
-    cd "$ROOT_DIR" && docker compose --env-file .docker-compose-env -f $COMPOSE_FILE build
+    cd "$ROOT_DIR" && docker compose --env-file "$ROOT_DIR/.docker-compose-env" -f "$COMPOSE_FILE" build
 fi
 
 # Run the Docker container
 echo "Starting Docker container..."
 if [ "$DETACHED" = "true" ]; then
     echo "Running in detached mode. Use 'docker compose -f $COMPOSE_FILE down' to stop."
-    cd "$ROOT_DIR" && docker compose --env-file .docker-compose-env -f $COMPOSE_FILE up -d
+    cd "$ROOT_DIR" && docker compose --env-file "$ROOT_DIR/.docker-compose-env" -f "$COMPOSE_FILE" up -d
 else
     echo "Running in interactive mode. Use Ctrl+C to stop."
-    cd "$ROOT_DIR" && docker compose --env-file .docker-compose-env -f $COMPOSE_FILE up
+    cd "$ROOT_DIR" && docker compose --env-file "$ROOT_DIR/.docker-compose-env" -f "$COMPOSE_FILE" up
 fi
 
 # Clean up temporary env file

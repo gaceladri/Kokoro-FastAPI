@@ -1,75 +1,112 @@
 #!/bin/bash
-# Script to set up environment variables securely
+# Script to set up environment configuration for Kokoro TTS
 
-# Set default config directory
+# Exit on error
+set -e
+
+# Default values
 CONFIG_DIR="./config"
 ENV_FILE="$CONFIG_DIR/.env"
-ENV_EXAMPLE="$CONFIG_DIR/.env.example"
+ENV_EXAMPLE_FILE="$CONFIG_DIR/.env.example"
+
+# Function to display help message
+show_help() {
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Set up environment configuration for Kokoro TTS"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help           Show this help message"
+    echo "  -c, --config DIR     Set config directory (default: ./config)"
+    echo "  --no-tracking        Disable usage tracking"
+    echo ""
+}
+
+# Parse command-line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -c|--config)
+            CONFIG_DIR="$2"
+            ENV_FILE="$CONFIG_DIR/.env"
+            ENV_EXAMPLE_FILE="$CONFIG_DIR/.env.example"
+            shift 2
+            ;;
+        --no-tracking)
+            DISABLE_TRACKING=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
 
 # Create config directory if it doesn't exist
-mkdir -p "$CONFIG_DIR"
-
-# Check if .env file already exists
-if [ -f "$ENV_FILE" ]; then
-    echo "Environment file $ENV_FILE already exists."
-    read -p "Do you want to overwrite it? (y/n): " overwrite
-    if [ "$overwrite" != "y" ]; then
-        echo "Keeping existing environment file."
-        exit 0
-    fi
+if [ ! -d "$CONFIG_DIR" ]; then
+    echo "Creating config directory: $CONFIG_DIR"
+    mkdir -p "$CONFIG_DIR"
 fi
 
-# Copy example file if it exists, otherwise create a new one
-if [ -f "$ENV_EXAMPLE" ]; then
-    cp "$ENV_EXAMPLE" "$ENV_FILE"
-    echo "Created $ENV_FILE from example template."
-else
-    # Create basic .env file
-    cat > "$ENV_FILE" << EOL
-# Supabase Configuration
-SUPABASE_URL=https://your-project-id.supabase.co
-SUPABASE_KEY=your-supabase-key
+# Create .env.example if it doesn't exist
+if [ ! -f "$ENV_EXAMPLE_FILE" ]; then
+    echo "Creating example environment file: $ENV_EXAMPLE_FILE"
+    cat > "$ENV_EXAMPLE_FILE" << EOL
+# Kokoro TTS Environment Configuration
 
-# Stripe Configuration
-STRIPE_SECRET_KEY=your-stripe-secret-key
+# Usage Tracking (optional)
+ENABLE_USAGE_TRACKING=false
+SUPABASE_URL=your_supabase_url
+SUPABASE_KEY=your_supabase_key
 
-# Feature Flags
-ENABLE_USAGE_TRACKING=true
+# Model Configuration
 DOWNLOAD_MODEL=true
-
-# API Settings
-API_HOST=0.0.0.0
-API_PORT=8880
-
-# Device Settings
 USE_GPU=true
-DEVICE=gpu
+USE_ONNX=false
 
-# Demo Configuration
-DEMO_MAX_CHARACTERS=700
-DEMO_DAILY_LIMIT=100
+# Server Configuration
+PORT=8880
+HOST=0.0.0.0
+LOG_LEVEL=info
+
+# Model Paths
+MODEL_DIR=src/models
+VOICES_DIR=src/voices/v1_0
+WEB_PLAYER_PATH=web
 EOL
-    echo "Created new $ENV_FILE file."
 fi
 
-# Set secure permissions
-chmod 600 "$ENV_FILE"
-echo "Set secure permissions (600) on $ENV_FILE"
+# If .env doesn't exist, create it from .env.example
+if [ ! -f "$ENV_FILE" ]; then
+    echo "Creating environment file from example: $ENV_FILE"
+    cp "$ENV_EXAMPLE_FILE" "$ENV_FILE"
+    
+    # Set secure permissions on .env file
+    chmod 600 "$ENV_FILE"
+    
+    echo "Please edit $ENV_FILE with your configuration values."
+else
+    echo "Environment file already exists: $ENV_FILE"
+fi
 
-# Get the script's directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-RUN_LOCAL_DEV_SCRIPT="$ROOT_DIR/scripts/docker/run-local-dev.sh"
+# If tracking is disabled, update .env file
+if [ "$DISABLE_TRACKING" = true ]; then
+    echo "Disabling usage tracking in $ENV_FILE"
+    sed -i 's/ENABLE_USAGE_TRACKING=.*/ENABLE_USAGE_TRACKING=false/' "$ENV_FILE"
+fi
 
-# Prompt user to edit the file
 echo ""
-echo "Please edit $ENV_FILE to set your secure environment variables."
-echo "You can use your preferred text editor, for example:"
-echo "  nano $ENV_FILE"
+echo "Environment setup complete!"
+echo "Configuration files:"
+echo "  - $ENV_FILE"
+echo "  - $ENV_EXAMPLE_FILE"
 echo ""
-echo "After editing, you can run the application with:"
-echo "  $RUN_LOCAL_DEV_SCRIPT --gpu"
-echo "  or"
-echo "  $RUN_LOCAL_DEV_SCRIPT --cpu"
-echo ""
-echo "For production environments, consider using Docker secrets or a secure secrets manager." 
+echo "Next steps:"
+echo "1. Edit $ENV_FILE with your configuration values"
+echo "2. Run ./run-local-dev.sh to start the service"
+echo "" 

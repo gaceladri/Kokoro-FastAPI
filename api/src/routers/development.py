@@ -1,28 +1,24 @@
-from typing import List, Union, AsyncGenerator, Tuple
+import json
+from pathlib import Path
 
-import numpy as np
-import torch
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from kokoro import KPipeline
 from loguru import logger
 
 from ..core.config import settings
-from ..services.audio import AudioNormalizer, AudioService
+from ..services.audio import AudioNormalizer
 from ..services.streaming_audio_writer import StreamingAudioWriter
+from ..services.temp_manager import TempFileWriter
 from ..services.text_processing import smart_split
 from ..services.tts_service import TTSService
-from ..services.temp_manager import TempFileWriter
-from ..structures import CaptionedSpeechRequest, CaptionedSpeechResponse, WordTimestamp
+from ..services.usage_tracking.usage_service import UsageTrackingService
+from ..structures import CaptionedSpeechRequest
 from ..structures.text_schemas import (
     GenerateFromPhonemesRequest,
     PhonemeRequest,
     PhonemeResponse,
 )
-import json
-import os
-from pathlib import Path
-
 
 router = APIRouter(tags=["text processing"])
 
@@ -341,6 +337,50 @@ async def create_captioned_speech(
             detail={
                 "error": "processing_error",
                 "message": str(e),
+                "type": "server_error",
+            },
+        )
+
+
+@router.get("/dev/health")
+async def health_check():
+    """Development health check endpoint"""
+    return {"status": "healthy", "environment": "development"}
+
+
+@router.post("/dev/jobs/report_usage")
+async def trigger_report_usage_job(
+    request: Request,
+    usage_service: UsageTrackingService = Depends(UsageTrackingService.create)
+):
+    """Trigger the job to report all overages to Stripe.
+    
+    This endpoint is for development and testing only.
+    """
+    if not settings.debug_mode:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "forbidden",
+                "message": "This endpoint is only available in debug mode",
+                "type": "permission_error",
+            },
+        )
+    
+    try:
+        results = await usage_service.report_all_overages_to_stripe()
+        return {
+            "status": "success",
+            "message": f"Usage report job completed. Processed {len(results)} subscriptions.",
+            "results": results
+        }
+    except Exception as e:
+        logger.error(f"Error running usage report job: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "server_error",
+                "message": f"Failed to run usage report job: {str(e)}",
                 "type": "server_error",
             },
         )

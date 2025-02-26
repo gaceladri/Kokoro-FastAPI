@@ -222,6 +222,11 @@ async def get_usage_stats(
             # Get user statistics
             user_id = user_info["id"]
             stats = await usage_service.get_user_statistics(user_id)
+            
+            # Ensure consistent field naming (characters_used renamed to total_characters in response)
+            if stats and "characters_used" in stats and "total_characters" not in stats:
+                stats["total_characters"] = stats["characters_used"]
+            
         elif request_type == "free":
             # Free tier statistics
             user_id = getattr(request.state, "user", {}).get("id")
@@ -240,6 +245,11 @@ async def get_usage_stats(
             
             # Get user statistics
             stats = await usage_service.get_user_statistics(user_id)
+            
+            # Ensure consistent field naming
+            if stats and "characters_used" in stats and "total_characters" not in stats:
+                stats["total_characters"] = stats["characters_used"]
+                
         else:
             # Demo statistics (IP-based)
             client_ip = getattr(request.state, "ip_address", None)

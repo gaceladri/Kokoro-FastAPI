@@ -73,3 +73,5 @@ uv.lock
 
 # Ignore config/.env.example
 config/.env.example
+migrations/
+.docker-compose-env

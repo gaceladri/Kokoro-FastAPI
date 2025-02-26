@@ -8,9 +8,11 @@ services:
       args:
         - CUDA_VERSION=${CUDA_VERSION:-12.8.0}
     volumes:
-      - ../../api:/app/api
-      # Mount config directory for environment variables
-      - ${CONFIG_DIR:-../../config}:/app/config
+      - ../../api:/app/api:rw
+      # Mount config directory for environment variables with absolute path
+      - ${PWD}/${CONFIG_DIR}:/app/config:rw
+      # Create a named volume for the models directory to avoid permission issues
+      - kokoro_models:/app/api/src/models:rw
     ports:
       - "${PORT:-8880}:8880"
     environment:
@@ -20,6 +22,11 @@ services:
       # Only set non-sensitive environment variables here
       - ENABLE_USAGE_TRACKING=${ENABLE_USAGE_TRACKING:-true}
       - DOWNLOAD_MODEL=${DOWNLOAD_MODEL:-true}
+      # Add Supabase credentials directly from env
+      - SUPABASE_URL=${SUPABASE_URL:-""}
+      - SUPABASE_KEY=${SUPABASE_KEY:-""}
+      # Add option to clean UV cache
+      - CLEAN_UV_CACHE=${CLEAN_UV_CACHE:-false}
     deploy:
       resources:
         reservations:
@@ -27,6 +34,10 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+volumes:
+  kokoro_models:
+    # Named volume for model files
 
   # # Gradio UI service
   # gradio-ui:

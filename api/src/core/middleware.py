@@ -4,12 +4,16 @@ import asyncio
 from datetime import datetime
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
+import time
 
 from fastapi import HTTPException, Request
 from loguru import logger
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from ..services.usage_tracking.usage_service import UsageTrackingService
+from ..services.usage_tracking.usage_service import (
+    UsageTrackingService,
+    parse_iso_datetime,
+)
 from .config import settings
 
 
@@ -37,12 +41,16 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
 
     async def _get_text_length(self, request: Request) -> Optional[int]:
         """Extract text length from request body for TTS endpoints."""
+        # Only validate text length for speech generation endpoints
         if request.url.path == "/v1/audio/speech":
             try:
                 body = await request.json()
                 return len(body.get("input", ""))
-            except:
+            except Exception as e:
+                logger.warning(f"Error extracting text length: {e}")
                 return None
+
+        # Other endpoints either don't have text or handle validation themselves
         return None
 
     def get_client_ip(self, request: Request) -> str:
@@ -65,6 +73,21 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
             if cached_info:
                 # Check if cache is still valid (5 minutes)
                 if datetime.utcnow().timestamp() - cached_info["timestamp"] < 300:
+                    # Ensure usage data has the proper fields
+                    if "info" in cached_info and "usage" in cached_info["info"]:
+                        usage = cached_info["info"]["usage"]
+                        if (
+                            usage
+                            and "total_characters" in usage
+                            and "characters_used" not in usage
+                        ):
+                            usage["characters_used"] = usage["total_characters"]
+                        elif (
+                            usage
+                            and "characters_used" in usage
+                            and "total_characters" not in usage
+                        ):
+                            usage["total_characters"] = usage["characters_used"]
                     return True, None, cached_info["info"]
 
         # Not in cache or expired, validate with service
@@ -74,6 +97,16 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
         )
 
         if is_valid:
+            # Ensure consistent field naming
+            if request_info and "usage" in request_info:
+                usage = request_info["usage"]
+                if (
+                    usage
+                    and "characters_used" in usage
+                    and "total_characters" not in usage
+                ):
+                    usage["total_characters"] = usage["characters_used"]
+
             # Cache successful validations
             async with self._cache_lock:
                 self._api_key_cache[api_key_prefix] = {
@@ -89,10 +122,16 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
         if not self._is_api_route(request.url.path):
             return await call_next(request)
 
+        # For time series tracking
+        request_start_time = time.time()
+        text_length = None
+        
         try:
             # Get API key and text length concurrently
             api_key = request.headers.get("X-API-Key")
-            user_id = request.headers.get("X-User-ID")  # Add user ID header for free tier
+            user_id = request.headers.get(
+                "X-User-ID"
+            )  # Add user ID header for free tier
             text_length_task = asyncio.create_task(self._get_text_length(request))
 
             # Determine request type based on headers
@@ -105,6 +144,13 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
             else:
                 # Demo request (no auth)
                 request_type = "demo"
+
+            # Skip text length validation for endpoints that don't require it
+            if request.url.path in ["/v1/audio/voices", "/v1/models"]:
+                # These endpoints don't require text length validation
+                logger.debug(f"Skipping text length validation for {request.url.path}")
+                response = await call_next(request)
+                return response
 
             # Get text length for all request types
             text_length = await text_length_task
@@ -145,10 +191,12 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                 request.state.ip_address = ip_address
             elif request_type == "free":
                 # Free tier with user ID
-                is_valid, error_message, context = await usage_service.validate_free_tier_request(
-                    user_id, text_length
-                )
-                
+                (
+                    is_valid,
+                    error_message,
+                    context,
+                ) = await usage_service.validate_free_tier_request(user_id, text_length)
+
                 if not is_valid:
                     raise HTTPException(
                         status_code=403,
@@ -158,7 +206,7 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                             "type": "authorization_error",
                         },
                     )
-                
+
                 # Set free tier state
                 request.state.request_type = "free"
                 request.state.user = {"id": user_id}
@@ -202,17 +250,42 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
 
             # Process request
             response = await call_next(request)
+            
+            # Time-series tracking for all requests
+            if settings.enable_usage_tracking:
+                # Calculate processing time
+                processing_time_ms = int((time.time() - request_start_time) * 1000)
+                
+                # Get text length for tracking if not already determined
+                if text_length is None:
+                    try:
+                        text_length = getattr(request.state, "text_length", 0)
+                    except:
+                        # Default to 0 if not available
+                        text_length = 0
+                
+                # Track the detailed event asynchronously
+                usage_service = await self._get_usage_service()
+                asyncio.create_task(
+                    usage_service.track_usage_event(
+                        request=request,
+                        endpoint=request.url.path,
+                        http_method=request.method,
+                        status_code=response.status_code,
+                        character_count=text_length or 0,  # Ensure we have a value
+                        processing_time_ms=processing_time_ms
+                    )
+                )
 
-            # Asynchronously track successful requests
+            # Asynchronously track successful requests (for billing/quota)
             if response.status_code == 200 and text_length is not None:
                 request_type = getattr(request.state, "request_type", None)
-                
+
                 if request_type == "demo":
                     # Track demo request
                     asyncio.create_task(
                         usage_service.track_demo_request(
-                            request.state.ip_address,
-                            text_length
+                            request.state.ip_address, text_length
                         )
                     )
                 elif request_type == "free":
@@ -232,10 +305,10 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                     asyncio.create_task(
                         usage_service.track_request(
                             subscription_id=subscription["id"],
-                            period_start=datetime.fromisoformat(
+                            period_start=parse_iso_datetime(
                                 subscription["current_period_start"]
                             ),
-                            period_end=datetime.fromisoformat(
+                            period_end=parse_iso_datetime(
                                 subscription["current_period_end"]
                             ),
                             character_count=text_length,
@@ -245,8 +318,68 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
             return response
 
         except HTTPException as e:
+            # For time series tracking of errors too
+            if settings.enable_usage_tracking:
+                try:
+                    # Calculate processing time
+                    processing_time_ms = int((time.time() - request_start_time) * 1000)
+                    
+                    # Get text length for tracking if not already determined
+                    if text_length is None:
+                        try:
+                            text_length = getattr(request.state, "text_length", 0)
+                        except:
+                            # Default to 0 if not available
+                            text_length = 0
+                    
+                    # Track the error event asynchronously
+                    usage_service = await self._get_usage_service()
+                    asyncio.create_task(
+                        usage_service.track_usage_event(
+                            request=request,
+                            endpoint=request.url.path,
+                            http_method=request.method,
+                            status_code=e.status_code,
+                            character_count=text_length or 0,  # Ensure we have a value
+                            processing_time_ms=processing_time_ms
+                        )
+                    )
+                except Exception as tracking_error:
+                    # Don't let tracking errors affect the main error response
+                    logger.error(f"Error tracking failed request: {tracking_error}")
+            
             raise e
         except Exception as e:
+            # Also track unexpected errors
+            if settings.enable_usage_tracking:
+                try:
+                    # Calculate processing time
+                    processing_time_ms = int((time.time() - request_start_time) * 1000)
+                    
+                    # Get text length for tracking if not already determined
+                    if text_length is None:
+                        try:
+                            text_length = getattr(request.state, "text_length", 0)
+                        except:
+                            # Default to 0 if not available
+                            text_length = 0
+                    
+                    # Track the error event asynchronously
+                    usage_service = await self._get_usage_service()
+                    asyncio.create_task(
+                        usage_service.track_usage_event(
+                            request=request,
+                            endpoint=request.url.path,
+                            http_method=request.method,
+                            status_code=500,  # Internal server error
+                            character_count=text_length or 0,  # Ensure we have a value
+                            processing_time_ms=processing_time_ms
+                        )
+                    )
+                except Exception as tracking_error:
+                    # Don't let tracking errors affect the main error response
+                    logger.error(f"Error tracking failed request: {tracking_error}")
+            
             logger.error(f"Error in usage tracking middleware: {e}")
             raise HTTPException(
                 status_code=500,

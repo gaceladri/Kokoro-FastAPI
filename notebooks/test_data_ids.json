@@ -1,0 +1,25 @@
+{
+  "users": [],
+  "products": [],
+  "subscriptions": [],
+  "api_keys": [],
+  "usage": [],
+  "free_usage": [
+    "f1d27f98-fffb-4942-8b75-9c317c4464af"
+  ],
+  "stripe_customers": [],
+  "stripe_products": [],
+  "stripe_subscriptions": [],
+  "test_data": {
+    "free_tier_user_id": "aeacceff-5a95-426b-99c9-a61b1fb0733d",
+    "basic_tier_user_id": "065684e4-74bd-4981-b6f7-7670832cbd99",
+    "premium_tier_user_id": "9c55fb83-2291-406d-a475-9c86eb2bf72f",
+    "basic_tier_api_key": "sk-kokoro-f2114403ff594bc6b3c802e0686de7e3",
+    "premium_tier_api_key": "sk-kokoro-ae8ed6126c414995ae7b8c83a818c75d",
+    "premium_subscription_id": "sub_1QwoA3CMctHMSNh2k8o5C14q",
+    "free_product_id": "ec0b736b-55c5-4c09-a824-3f9bf9023fe4",
+    "basic_product_id": "4a920814-a313-4451-9c9c-60c05b8ee448",
+    "premium_product_id": "083d4416-dcea-4c01-bd77-ec6ea1a8b229",
+    "demo_user_id": "f7720a8b-f876-4646-9e01-dc15f0b5a78b"
+  }
+}

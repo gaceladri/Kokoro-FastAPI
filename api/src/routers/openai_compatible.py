@@ -17,7 +17,7 @@ from loguru import logger
 from ..core.config import settings
 from ..services.audio import AudioService
 from ..services.tts_service import TTSService
-from ..services.usage_tracking.usage_service import UsageTrackingService
+from ..services.usage_tracking.usage_service import UsageTrackingService, parse_iso_datetime
 from ..structures import OpenAISpeechRequest
 
 
@@ -411,8 +411,8 @@ async def create_speech(
                     else:
                         await usage_service.track_request(
                             subscription_id=subscription["id"],
-                            period_start=datetime.fromisoformat(subscription["current_period_start"]),
-                            period_end=datetime.fromisoformat(subscription["current_period_end"]),
+                            period_start=parse_iso_datetime(subscription["current_period_start"]),
+                            period_end=parse_iso_datetime(subscription["current_period_end"]),
                             character_count=len(request.input),
                         )
                 elif request_type == "free":
