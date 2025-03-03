@@ -893,27 +893,25 @@ class SupabaseClient:
         logger.info("Circuit breaker manually reset")
 
     async def track_usage_events_batch(self, events: List[Dict]) -> bool:
-        """Track multiple usage events in a single batch operation.
+        """Track multiple usage events in a batch operation.
         
         Args:
-            events: List of event data dictionaries
+            events: List of event dictionaries to track
             
         Returns:
-            bool: True if tracking was successful
+            bool: True if successful, False otherwise
         """
-        # First check if client is initialized - don't use circuit breaker here
-        if self._client is None:
-            logger.warning("Supabase client not initialized")
-            return False
-            
-        if not events:
-            return True  # No events to track is a success
-            
         try:
-            # Generate request IDs for events that don't have them
+            if not events:
+                return True
+                
+            # Generate a single batch request_id that will be used for all events missing request_id
+            batch_request_id = str(uuid.uuid4())
+                
             for event in events:
                 if "request_id" not in event:
-                    event["request_id"] = str(uuid.uuid4())
+                    # Use the same batch_request_id for all events in this batch
+                    event["request_id"] = batch_request_id
                     
                 # Add timestamp if not present
                 if "timestamp" not in event:
