@@ -71,7 +71,8 @@ examples/phoneme_examples/output/*.wav
 examples/assorted_checks/benchmarks/output_audio/*
 uv.lock
 
-# Ignore config/.env.example
+
 config/.env.example
 migrations/
 .docker-compose-env
+notebooks/test_data_ids.json

@@ -1,7 +1,11 @@
 """Supabase client for usage tracking."""
 
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+import asyncio
+import time
+from typing import Dict, List, Optional, Tuple, Any
+import uuid
+import json
 
 from loguru import logger
 from supabase import AsyncClient, acreate_client
@@ -14,6 +18,13 @@ class SupabaseClient:
 
     _instance: Optional["SupabaseClient"] = None
     _client: Optional[AsyncClient] = None
+    
+    # Circuit breaker properties
+    _circuit_open: bool = False
+    _consecutive_failures: int = 0
+    _last_failure_time: float = 0
+    _failure_threshold: int = 3
+    _recovery_timeout: int = 30  # seconds
 
     def __init__(self):
         """Initialize Supabase client."""
@@ -33,8 +44,75 @@ class SupabaseClient:
         try:
             self._client = await acreate_client(settings.supabase_url, settings.supabase_key)
             logger.info("Supabase client initialized")
+            # Reset circuit breaker state on successful initialization
+            self._circuit_open = False
+            self._consecutive_failures = 0
         except Exception as e:
             logger.error(f"Failed to initialize Supabase client: {e}")
+            self._record_failure()
+
+    def _record_failure(self):
+        """Record a database failure and possibly open the circuit."""
+        self._consecutive_failures += 1
+        self._last_failure_time = time.time()
+        
+        if self._consecutive_failures >= self._failure_threshold:
+            if not self._circuit_open:
+                logger.warning(f"Circuit breaker opened after {self._consecutive_failures} consecutive failures")
+                self._circuit_open = True
+
+    def _record_success(self):
+        """Record a successful database operation and reset failure counter."""
+        if self._consecutive_failures > 0:
+            self._consecutive_failures = 0
+            
+        if self._circuit_open:
+            logger.info("Circuit breaker closed after successful operation")
+            self._circuit_open = False
+
+    def _should_attempt_operation(self) -> bool:
+        """Check if we should attempt a database operation based on circuit state."""
+        # If circuit is closed, always attempt
+        if not self._circuit_open:
+            return True
+            
+        # If circuit is open, check if we've waited long enough to try again
+        current_time = time.time()
+        if current_time - self._last_failure_time > self._recovery_timeout:
+            logger.info(f"Attempting recovery after {self._recovery_timeout}s timeout")
+            return True
+            
+        return False
+
+    async def _execute_with_circuit_breaker(self, operation_func, *args, **kwargs):
+        """Execute a database operation with circuit breaker protection."""
+        if not self._should_attempt_operation():
+            logger.warning("Circuit breaker open, skipping database operation")
+            return None
+            
+        if not self._client:
+            logger.warning("Supabase client not initialized")
+            return None
+            
+        try:
+            # Set a timeout for the operation to prevent hanging
+            operation_start = time.time()
+            result = await asyncio.wait_for(
+                operation_func(*args, **kwargs),
+                timeout=5.0  # 5 second timeout
+            )
+            operation_time = time.time() - operation_start
+            logger.info(f"Database operation completed in {operation_time:.4f}s")
+            
+            self._record_success()
+            return result
+        except (asyncio.TimeoutError, Exception) as e:
+            self._record_failure()
+            if isinstance(e, asyncio.TimeoutError):
+                logger.error("Database operation timed out")
+            else:
+                logger.error(f"Database operation failed: {e}")
+            return None
 
     @classmethod
     async def get_instance(cls) -> "SupabaseClient":
@@ -48,17 +126,19 @@ class SupabaseClient:
         """Validate an API key and return user information.
 
         Args:
-            api_key_prefix: First 8 characters of the API key
+            api_key_prefix: Prefix of the API key (16 characters)
 
         Returns:
             Optional[Dict]: User and subscription info if valid, None if invalid
         """
-        if not self._client:
-            logger.warning("Supabase client not initialized")
-            return None
+        async def _operation():
+            if not self._client:
+                return None
 
-        try:
+            validation_start = time.time()
+            
             # Get API key info
+            query_start = time.time()
             query = (
                 self._client.table("api_keys")
                 .select("*, users(*)")
@@ -70,6 +150,8 @@ class SupabaseClient:
             )
             
             response = await query.execute()
+            query_time = time.time() - query_start
+            logger.info(f"Supabase API key query took {query_time:.4f}s")
 
             if not response.data or len(response.data) == 0:
                 logger.warning(f"Invalid API key prefix: {api_key_prefix}")
@@ -78,6 +160,7 @@ class SupabaseClient:
             api_key_data = response.data[0]
 
             # Update last_used_at
+            update_start = time.time()
             update_query = (
                 self._client.table("api_keys")
                 .update({"last_used_at": datetime.utcnow().isoformat()})
@@ -85,27 +168,22 @@ class SupabaseClient:
             )
             
             await update_query.execute()
+            update_time = time.time() - update_start
+            logger.info(f"Supabase API key update took {update_time:.4f}s")
+            
+            total_time = time.time() - validation_start
+            logger.info(f"Total Supabase API key validation took {total_time:.4f}s")
 
             return api_key_data
 
-        except Exception as e:
-            logger.error(f"Failed to validate API key: {e}")
-            return None
+        return await self._execute_with_circuit_breaker(_operation)
 
     async def get_active_subscription(self, user_id: str) -> Optional[Dict]:
-        """Get active subscription for a user.
+        """Get active subscription for a user."""
+        async def _operation():
+            if not self._client:
+                return None
 
-        Args:
-            user_id: User identifier
-
-        Returns:
-            Optional[Dict]: Active subscription info if exists, None otherwise
-        """
-        if not self._client:
-            logger.warning("Supabase client not initialized")
-            return None
-
-        try:
             # Get active subscription with product info
             query = (
                 self._client.table("subscriptions")
@@ -121,10 +199,8 @@ class SupabaseClient:
                 return None
                 
             return response.data[0]
-
-        except Exception as e:
-            logger.error(f"Failed to get subscription: {e}")
-            return None
+            
+        return await self._execute_with_circuit_breaker(_operation)
 
     async def get_subscription(self, subscription_id: str) -> Optional[Dict]:
         """Get subscription by ID.
@@ -489,69 +565,200 @@ class SupabaseClient:
         ip_address: Optional[str] = None,
         processing_time_ms: Optional[int] = None,
         user_agent: Optional[str] = None,
-        metadata: Optional[Dict] = None,
+        referrer: Optional[str] = None,
+        voice_id: Optional[str] = None,
+        audio_duration_ms: Optional[int] = None,
+        word_count: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        request_id: Optional[str] = None,
     ) -> bool:
-        """Track a single API request event for time-series analytics.
-
-        Args:
-            endpoint: API endpoint path
-            http_method: HTTP method (GET, POST, etc.)
-            status_code: HTTP status code
-            character_count: Number of characters processed
-            request_type: Type of request ('paid', 'free', or 'demo')
-            user_id: User ID if available
-            subscription_id: Subscription ID if available
-            ip_address: Client IP address
-            processing_time_ms: Request processing time in milliseconds
-            user_agent: User agent string
-            metadata: Additional request metadata
-
-        Returns:
-            bool: True if tracking successful, False otherwise
-        """
+        """Track a usage event with circuit breaker pattern."""
+        try:
+            # Generate request ID if not provided
+            if not request_id:
+                request_id = str(uuid.uuid4())
+                
+            # Current time in ISO format
+            timestamp = datetime.utcnow().isoformat()
+            
+            # Execute the function with the circuit breaker pattern
+            return await self._execute_with_circuit_breaker(
+                self._track_usage_event_impl,
+                endpoint=endpoint,
+                http_method=http_method,
+                status_code=status_code,
+                character_count=character_count,
+                request_type=request_type,
+                user_id=user_id,
+                subscription_id=subscription_id,
+                ip_address=ip_address,
+                processing_time_ms=processing_time_ms,
+                user_agent=user_agent,
+                referrer=referrer,
+                voice_id=voice_id,
+                audio_duration_ms=audio_duration_ms,
+                word_count=word_count,
+                metadata=metadata,
+                request_id=request_id,
+                timestamp=timestamp
+            )
+        except Exception as e:
+            logger.error(f"Failed to track usage event: {str(e)}")
+            self._record_failure()
+            return False
+            
+    async def _track_usage_event_impl(
+        self,
+        endpoint: str,
+        http_method: str,
+        status_code: int,
+        character_count: int,
+        request_type: str,
+        user_id: Optional[str] = None,
+        subscription_id: Optional[str] = None,
+        ip_address: Optional[str] = None,
+        processing_time_ms: Optional[int] = None,
+        user_agent: Optional[str] = None,
+        referrer: Optional[str] = None,
+        voice_id: Optional[str] = None,
+        audio_duration_ms: Optional[int] = None,
+        word_count: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        request_id: Optional[str] = None,
+        timestamp: Optional[str] = None,
+    ) -> bool:
+        """Actual implementation of the track_usage_event method."""
         if not self._client:
             logger.warning("Supabase client not initialized")
             return False
             
         try:
-            # Create event record
+            # Create event data
             event_data = {
+                "request_id": request_id,
+                "timestamp": timestamp or datetime.utcnow().isoformat(),
                 "endpoint": endpoint,
                 "http_method": http_method,
                 "status_code": status_code,
                 "character_count": character_count,
                 "request_type": request_type,
-                "timestamp": datetime.utcnow().isoformat(),
             }
             
-            # Add optional fields if they exist
+            # Add optional fields if provided
             if user_id:
                 event_data["user_id"] = user_id
-            
             if subscription_id:
                 event_data["subscription_id"] = subscription_id
-                
             if ip_address:
                 event_data["ip_address"] = ip_address
-                
             if processing_time_ms is not None:
                 event_data["processing_time_ms"] = processing_time_ms
-                
             if user_agent:
                 event_data["user_agent"] = user_agent
-                
+            if referrer:
+                event_data["referrer"] = referrer
+            if voice_id:
+                event_data["voice_id"] = voice_id
+            if audio_duration_ms is not None:
+                event_data["audio_duration_ms"] = audio_duration_ms
+            if word_count is not None:
+                event_data["word_count"] = word_count
             if metadata:
-                event_data["metadata"] = metadata
+                event_data["metadata"] = json.dumps(metadata)
                 
-            # Insert the event
-            insert_query = self._client.table("usage_events").insert(event_data)
-            await insert_query.execute()
+            # Insert event into the database
+            result = await self._client.from_("usage_events").insert(event_data).execute()
             
+            # Check if the insertion was successful
+            if result.data:
+                logger.debug(f"Successfully tracked usage event: {request_id}")
+                return True
+            else:
+                logger.warning(f"Failed to track usage event: {result.error}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error tracking usage event: {e}")
+            return False
+
+    async def update_usage_event(
+        self,
+        request_id: str,
+        updates: Dict[str, Any]
+    ) -> bool:
+        """Update an existing usage event entry, primarily for streaming requests.
+        
+        Args:
+            request_id: The unique request ID of the event to update
+            updates: Dictionary containing the fields to update
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not self._should_attempt_operation():
+            return False
+        
+        if not self._client:
+            logger.warning("Supabase client not initialized.")
+            return False
+            
+        try:
+            # Execute the function with the circuit breaker pattern
+            return await self._execute_with_circuit_breaker(
+                self._update_usage_event_impl,
+                request_id=request_id,
+                updates=updates
+            )
+        except Exception as e:
+            logger.error(f"Failed to update usage event: {str(e)}")
+            self._record_failure()
+            return False
+    
+    async def _update_usage_event_impl(
+        self,
+        request_id: str,
+        updates: Dict[str, Any]
+    ) -> bool:
+        """Implementation of usage event update.
+        
+        Args:
+            request_id: The unique request ID of the event to update
+            updates: Dictionary containing the fields to update
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # First try to use an RPC call for better performance
+            try:
+                result = await self._client.rpc(
+                    "update_usage_event",
+                    {
+                        "p_request_id": request_id,
+                        "p_updates": updates
+                    },
+                    timeout=5
+                ).execute()
+                
+                if result.data and result.data.get("success", False):
+                    return True
+            except Exception as e:
+                logger.warning(f"RPC update_usage_event failed, falling back to direct update: {e}")
+                
+            # Fallback to direct update if RPC fails
+            result = await self._client.table("usage_events").update(
+                updates
+            ).eq("request_id", request_id).execute()
+            
+            if not result.data:
+                logger.warning(f"Failed to update usage event {request_id}: No data returned")
+                return False
+                
             return True
             
         except Exception as e:
-            logger.error(f"Failed to track usage event: {e}")
-            return False
+            logger.error(f"Error updating usage event: {e}")
+            raise  # Re-raise to be caught by circuit breaker
 
     async def check_overage_and_report_to_stripe(
         self, subscription_id: str, metered_item_id: str, character_limit: int
@@ -662,3 +869,120 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"Failed to get metered subscriptions: {e}")
             return None
+
+    async def check_health(self) -> bool:
+        """Check if the database is available and the circuit is closed."""
+        # If circuit is open, we know there are issues
+        if self._circuit_open:
+            return False
+            
+        if not self._client:
+            return False
+            
+        try:
+            # Simple query to test connection
+            await self._client.from_("health_check").select("count").limit(1).execute()
+            return True
+        except Exception:
+            return False
+
+    async def reset_circuit_breaker(self):
+        """Manually reset the circuit breaker state."""
+        self._circuit_open = False
+        self._consecutive_failures = 0
+        logger.info("Circuit breaker manually reset")
+
+    async def track_usage_events_batch(self, events: List[Dict]) -> bool:
+        """Track multiple usage events in a single batch operation.
+        
+        Args:
+            events: List of event data dictionaries
+            
+        Returns:
+            bool: True if tracking was successful
+        """
+        # First check if client is initialized - don't use circuit breaker here
+        if self._client is None:
+            logger.warning("Supabase client not initialized")
+            return False
+            
+        if not events:
+            return True  # No events to track is a success
+            
+        try:
+            # Generate request IDs for events that don't have them
+            for event in events:
+                if "request_id" not in event:
+                    event["request_id"] = str(uuid.uuid4())
+                    
+                # Add timestamp if not present
+                if "timestamp" not in event:
+                    event["timestamp"] = datetime.utcnow().isoformat()
+            
+            # Note: RPC function 'insert_usage_events_batch' doesn't exist in the database schema
+            # Use chunked inserts directly instead of attempting RPC
+            
+            # Split into chunks of 50 records for better performance
+            chunk_size = 50
+            success_count = 0
+            total_chunks = (len(events) + chunk_size - 1) // chunk_size  # Ceiling division
+            
+            for i in range(0, len(events), chunk_size):
+                chunk = events[i:i+chunk_size]
+                try:
+                    insert_result = await asyncio.wait_for(
+                        self._client.table("usage_events").insert(chunk).execute(),
+                        timeout=5.0
+                    )
+                    
+                    if insert_result.data:
+                        success_count += 1
+                except Exception as chunk_error:
+                    logger.error(f"Error inserting chunk {i//chunk_size + 1}/{total_chunks}: {chunk_error}")
+            
+            # Consider it a success if at least half the chunks were successful
+            return success_count >= total_chunks / 2
+                
+        except Exception as e:
+            logger.error(f"Failed to track usage events batch: {e}")
+            return False
+            
+    async def purge_old_events(self, days_to_retain: int = 90) -> bool:
+        """Purge usage events older than the specified retention period.
+        
+        Args:
+            days_to_retain: Number of days of data to keep
+            
+        Returns:
+            bool: True if purge was successful
+        """
+        if not self._client:
+            logger.warning("Supabase client not initialized")
+            return False
+            
+        try:
+            # Calculate cutoff date
+            cutoff_date = (datetime.utcnow() - timedelta(days=days_to_retain)).isoformat()
+            
+            # Try to use the more efficient RPC if available
+            try:
+                result = await self._client.rpc(
+                    "purge_old_usage_events",
+                    {"p_cutoff_date": cutoff_date}
+                ).execute()
+                
+                if result.data:
+                    logger.info(f"Purged {result.data.get('deleted_count', 0)} old usage events")
+                    return True
+            except Exception as e:
+                logger.warning(f"RPC purge failed, falling back to direct delete: {e}")
+            
+            # Fallback to direct delete
+            # Note: This might time out for large datasets, but the RPC is designed to avoid that
+            delete_result = await self._client.table("usage_events").delete().lt("timestamp", cutoff_date).execute()
+            logger.info(f"Purged old usage events before {cutoff_date}")
+            return True
+                
+        except Exception as e:
+            logger.error(f"Failed to purge old events: {e}")
+            return False

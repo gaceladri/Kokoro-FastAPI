@@ -1215,6 +1215,92 @@ def test_voices_endpoint(api_key=None, user_id=None):
     print("\n--- Voices endpoint test complete ---")
 
 
+def test_streaming_tts_api():
+    """Test the TTS API with streaming enabled to demonstrate streaming behavior."""
+    print("Testing TTS API with streaming enabled")
+    
+    # Define the test text and voice
+    test_text = "This is an example of streaming audio from the Kokoro TTS API. This should demonstrate how audio chunks are processed and delivered."
+    test_voice = "af_bella"  # Using a default voice
+    
+    # Create the payload with streaming enabled
+    payload = {
+        "model": "kokoro",
+        "input": test_text,
+        "voice": test_voice,
+        "response_format": "mp3",
+        "stream": True  # Enable streaming
+    }
+    
+    try:
+        print(f"Sending streaming speech request with text: '{test_text[:50]}...'")
+        
+        # Send request with stream parameter set to True
+        response = requests.post(
+            f"{API_BASE_URL}/v1/audio/speech", 
+            json=payload, 
+            stream=True,
+            headers={"X-Debug": "true"}  # Enable debug headers
+        )
+        
+        print(f"Response status code: {response.status_code}")
+        
+        if response.status_code == 200:
+            # Process streaming response
+            print("Receiving audio stream...")
+            
+            # Debug headers from response
+            for header, value in response.headers.items():
+                if header.startswith('X-'):
+                    print(f"Header {header}: {value}")
+            
+            # Read chunks and count them
+            chunks = []
+            chunk_count = 0
+            chunk_sizes = []
+            
+            start_time = time.time()
+            for chunk in response.iter_content(chunk_size=None):
+                chunk_count += 1
+                if chunk:
+                    chunks.append(chunk)
+                    chunk_sizes.append(len(chunk))
+                    
+                    # Print info about first few chunks
+                    if chunk_count <= 3:
+                        print(f"Received chunk {chunk_count}: {len(chunk)} bytes")
+            
+            total_time = time.time() - start_time
+            print(f"Streaming completed: received {chunk_count} chunks in {total_time:.2f} seconds")
+            print(f"First few chunk sizes: {chunk_sizes[:5]}")
+            print(f"Total audio size: {sum(chunk_sizes)} bytes")
+            
+            # Combine all chunks and play
+            if chunks:
+                full_audio = b''.join(chunks)
+                print(f"Playing combined audio ({len(full_audio)} bytes)")
+                return play_audio(full_audio)
+            else:
+                print("No audio chunks received!")
+                return None
+        else:
+            print(f"Error response: {response.text}")
+            try:
+                error_json = response.json()
+                print(f"Error details: {display_json(error_json)}")
+            except:
+                print("Response was not JSON formatted")
+            return None
+            
+    except requests.exceptions.ConnectionError:
+        print("Connection error: Unable to connect to the API server.")
+        print(f"Please ensure the API server is running at {API_BASE_URL}")
+        return None
+    except Exception as e:
+        print(f"Error during streaming audio test: {str(e)}")
+        return None
+
+
 if __name__ == "__main__":
     print("Running API tests...")
 
@@ -1261,3 +1347,7 @@ if __name__ == "__main__":
     print(
         "To run advanced tests like overage billing, uncomment the relevant sections in the script."
     )
+
+    # Run the streaming test
+    print("\n=== Running streaming TTS API test ===")
+    streaming_audio = test_streaming_tts_api()

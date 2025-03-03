@@ -3,7 +3,7 @@ import time
 from datetime import datetime
 
 import psutil
-from fastapi import APIRouter
+from fastapi import APIRouter, Request, Depends
 
 try:
     import GPUtil
@@ -12,7 +12,26 @@ try:
 except ImportError:
     GPU_AVAILABLE = False
 
-router = APIRouter(tags=["debug"])
+import sys
+import os
+import platform
+import gc
+import json
+from typing import Dict, List, Optional
+
+import torch
+from loguru import logger
+
+from ..core.config import settings
+from ..inference.model_manager import get_manager
+from ..inference.voice_manager import get_manager as get_voice_manager
+from ..services.usage_tracking.usage_service import UsageTrackingService
+
+router = APIRouter(
+    prefix="/debug",
+    tags=["Debug"],
+    responses={404: {"description": "Not found"}},
+)
 
 
 @router.get("/debug/threads")
@@ -199,3 +218,48 @@ async def get_session_pool_info():
                 pass
 
     return pool_info
+
+
+@router.get("/api-key-cache", tags=["Debug"])
+async def get_api_key_cache_status(
+    request: Request,
+    usage_service: UsageTrackingService = Depends(UsageTrackingService.create),
+):
+    """Get status of the API key cache manager."""
+    
+    if not settings.enable_usage_tracking:
+        return {
+            "enabled": False,
+            "message": "Usage tracking is disabled, so API key cache is not active."
+        }
+    
+    try:
+        # Get key cache manager
+        key_cache = await usage_service._get_key_cache_manager()
+        
+        # Get status
+        status = key_cache.get_status()
+        
+        # Add some stats from the middleware
+        middleware_stats = {}
+        for middleware in request.app.middleware_stack.middlewares:
+            if hasattr(middleware, "_api_key_cache"):
+                middleware_stats["middleware_cache_keys"] = len(middleware._api_key_cache)
+                break
+        
+        # Combine stats
+        combined_stats = {**status, **middleware_stats}
+        
+        return {
+            "enabled": True,
+            "status": "healthy" if status["last_refresh_success"] else "unhealthy",
+            "stats": combined_stats,
+            "message": "API key cache is operational."
+        }
+    except Exception as e:
+        return {
+            "enabled": True,
+            "status": "error",
+            "error": str(e),
+            "message": "Failed to get API key cache status."
+        }

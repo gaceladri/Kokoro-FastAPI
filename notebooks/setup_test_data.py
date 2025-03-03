@@ -24,6 +24,8 @@ import pathlib
 import time
 import uuid
 import base64
+import random
+import traceback
 
 import stripe
 from dotenv import load_dotenv
@@ -91,6 +93,7 @@ def load_test_data_ids():
         "api_keys": [],
         "usage": [],
         "free_usage": [],
+        "usage_events": [],  # Add usage_events to default structure
         "stripe_customers": [],
         "stripe_products": [],
         "stripe_subscriptions": [],
@@ -364,6 +367,9 @@ def create_product(name, description, price, request_limit=None):
 
         # Determine if this is the premium tier (for metered billing)
         is_premium = "Premium" in name
+        
+        # Extract the tier from the name (e.g., "Free Tier" -> "free")
+        tier = name.lower().replace(" tier", "")
 
         # Create product in Stripe
         stripe_product_id, stripe_price_id, stripe_metered_price_id = (
@@ -380,6 +386,7 @@ def create_product(name, description, price, request_limit=None):
             "stripe_metered_price_id": stripe_metered_price_id,  # Store the metered price ID
             "active": True,
             "monthly_request_limit": request_limit,
+            "tier": tier,  # Add the tier field
         }
 
         response = supabase.table("products").insert(product_data).execute()
@@ -612,7 +619,7 @@ def create_api_key(user_id, name="Test API Key"):
             # For existing keys, we need to create a new one for testing
             # since we can't retrieve the original unhashed key
             api_key = f"sk-kokoro-{uuid.uuid4().hex}"
-            key_prefix = api_key[:8]
+            key_prefix = api_key[:16]
             
             # Update the existing API key with the new value
             update_data = {
@@ -638,7 +645,7 @@ def create_api_key(user_id, name="Test API Key"):
 
         # Generate API key
         api_key = f"sk-kokoro-{uuid.uuid4().hex}"
-        key_prefix = api_key[:8]
+        key_prefix = api_key[:16]
 
         # Store in database
         api_key_data = {
@@ -724,8 +731,456 @@ def create_demo_user():
         return None
 
 
+def create_usage_events(user_id=None, subscription_id=None, ip_address=None, count=5):
+    """Create sample usage events for analytics testing
+    
+    Args:
+        user_id: User ID for the events (for free or paid tier)
+        subscription_id: Subscription ID for the events (for paid tier)
+        ip_address: IP address for the events (for demo tier)
+        count: Number of events to create
+        
+    Returns:
+        list: List of created usage event IDs
+    """
+    test_data = load_test_data_ids()
+    
+    if "usage_events" not in test_data:
+        test_data["usage_events"] = []
+    
+    # Determine request type based on provided identifiers
+    if subscription_id:
+        request_type = "paid"
+    elif user_id:
+        request_type = "free"
+    elif ip_address:
+        request_type = "demo"
+    else:
+        print("Error: Must provide at least one of user_id, subscription_id, or ip_address")
+        return []
+    
+    # Create sample usage events
+    created_ids = []
+    
+    try:
+        # Fetch valid voice IDs from the database
+        voices_response = supabase.table("voices").select("voice_id").execute()
+        if not voices_response.data:
+            print("Error: No voices found in the database. Please run migrations first.")
+            return []
+            
+        valid_voices = [voice["voice_id"] for voice in voices_response.data]
+        print(f"Found {len(valid_voices)} valid voices in the database")
+        
+        # Available endpoints
+        endpoints = ["/v1/audio/speech", "/v1/models", "/v1/audio/voices", "/health"]
+        
+        # HTTP methods
+        methods = ["GET", "POST"]
+        
+        # Sample user agents
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+            "Python-requests/2.26.0",
+            "curl/7.68.0"
+        ]
+        
+        # Generate events over the past 7 days
+        now = datetime.datetime.utcnow()
+        
+        for i in range(count):
+            # Generate random timestamp within the past week
+            timestamp = (now - datetime.timedelta(
+                days=random.randint(0, 7),
+                hours=random.randint(0, 23),
+                minutes=random.randint(0, 59),
+                seconds=random.randint(0, 59)
+            )).isoformat()
+            
+            # Set up common event data
+            event_data = {
+                "timestamp": timestamp,
+                "request_type": request_type,
+                "endpoint": random.choice(endpoints),
+                "http_method": random.choice(methods),
+                "status_code": random.choices([200, 400, 500], weights=[0.95, 0.03, 0.02])[0],
+                "character_count": random.randint(10, 2000),
+                "request_id": str(uuid.uuid4())
+            }
+            
+            # Add identifier based on request type
+            if request_type == "paid":
+                event_data["subscription_id"] = subscription_id
+                event_data["user_id"] = user_id  # Also include user_id for paid requests
+            elif request_type == "free":
+                event_data["user_id"] = user_id
+            else:  # demo
+                event_data["ip_address"] = ip_address
+            
+            # Add additional metrics for /audio/speech endpoint
+            if event_data["endpoint"] == "/v1/audio/speech":
+                event_data["voice_id"] = random.choice(valid_voices)
+                event_data["processing_time_ms"] = random.randint(100, 2000)
+                
+                # Estimate word count based on character count (roughly 5 chars per word)
+                event_data["word_count"] = max(1, event_data["character_count"] // 5)
+                
+                # Estimate audio duration based on character count (roughly 70ms per character)
+                event_data["audio_duration_ms"] = event_data["character_count"] * 70
+                
+                # Add metadata for audio format
+                formats = ["mp3", "opus", "aac", "flac", "wav"]
+                event_data["metadata"] = {
+                    "format": random.choice(formats),
+                    "model": random.choice(["tts-1", "tts-1-hd", "kokoro"])
+                }
+            
+            # Add user agent
+            event_data["user_agent"] = random.choice(user_agents)
+            
+            # Insert the event
+            response = supabase.table("usage_events").insert(event_data).execute()
+            
+            if response.data:
+                event_id = response.data[0]["id"]
+                created_ids.append(event_id)
+                test_data["usage_events"].append(event_id)
+                print(f"Created usage event: {event_id} for {'subscription' if subscription_id else 'user' if user_id else 'IP'} {subscription_id or user_id or ip_address}")
+            else:
+                print(f"Failed to create usage event")
+        
+        # Save IDs for cleanup
+        save_test_data_ids(test_data)
+        return created_ids
+        
+    except Exception as e:
+        print(f"Error creating usage events: {e}")
+        return created_ids
+
+
+def create_usage_pattern_events(user_id, subscription_id=None, days=7, requests_per_day=10):
+    """Create a realistic pattern of usage events over several days
+    
+    This function generates usage events with a realistic pattern over time,
+    simulating daily usage patterns for analytics testing.
+    
+    Args:
+        user_id: User ID for events
+        subscription_id: Subscription ID for paid tier events
+        days: Number of days of history to create (default: 7)
+        requests_per_day: Average number of requests per day (default: 10)
+        
+    Returns:
+        list: List of created usage event IDs
+    """
+    test_data = load_test_data_ids()
+    
+    if "usage_events" not in test_data:
+        test_data["usage_events"] = []
+    
+    created_ids = []
+    
+    # Determine request type
+    request_type = "paid" if subscription_id else "free"
+    
+    # Sample user agents to simulate different clients
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 Edg/91.0.864.59",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36",
+        "Kokoro-TTS-Client/1.0",
+        "Python-Requests/2.26.0",
+        "Node-Fetch/3.1.0",
+        "curl/7.68.0",
+    ]
+    
+    # Fetch valid voice IDs from the database
+    try:
+        voices_response = supabase.table("voices").select("voice_id").execute()
+        if not voices_response.data:
+            print("Error: No voices found in the database. Please run migrations first.")
+            return []
+            
+        valid_voices = [voice["voice_id"] for voice in voices_response.data]
+        print(f"Found {len(valid_voices)} valid voices in the database for pattern events")
+    except Exception as e:
+        print(f"Error fetching voices: {e}")
+        return []
+    
+    # Sample endpoints to simulate different API calls
+    endpoints = [
+        "/v1/audio/speech",
+        "/v1/audio/transcriptions",
+        "/v1/audio/translations",
+    ]
+    
+    # Sample status codes with distribution weights
+    status_codes = [200] * 95 + [400] * 3 + [401] * 1 + [500] * 1  # 95% success, 5% errors
+    
+    # Sample text lengths (short, medium, long)
+    text_lengths = [(10, 50), (100, 300), (500, 1000)]
+    
+    try:
+        print(f"Creating usage pattern events over {days} days...")
+        
+        # Generate events for each day, going back from today
+        for day in range(days, 0, -1):
+            # Calculate date for this batch of events
+            event_date = datetime.datetime.now() - datetime.timedelta(days=day)
+            date_str = event_date.strftime("%Y-%m-%d")
+            
+            # Vary the number of requests per day slightly to create a realistic pattern
+            # More requests on weekdays, fewer on weekends
+            weekday = event_date.weekday()
+            is_weekend = weekday >= 5  # 5=Saturday, 6=Sunday
+            
+            # Base daily variation: weekends have ~60% of weekday traffic
+            daily_factor = 0.6 if is_weekend else 1.0
+            
+            # Add some randomness (±20%)
+            random_factor = random.uniform(0.8, 1.2)
+            
+            # Calculate number of requests for this day
+            day_requests = max(1, int(requests_per_day * daily_factor * random_factor))
+            
+            print(f"Creating {day_requests} events for {date_str} ({['Weekday', 'Weekend'][is_weekend]})...")
+            
+            # Generate hourly distribution (more activity during business hours)
+            hours = []
+            for _ in range(day_requests):
+                if is_weekend:
+                    # Weekend hours are more spread out
+                    hour = random.choices(
+                        range(24),
+                        weights=[1, 1, 1, 1, 1, 1, 1, 2, 3, 4, 5, 5, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 1, 1],
+                        k=1
+                    )[0]
+                else:
+                    # Weekday hours peak during business hours
+                    hour = random.choices(
+                        range(24),
+                        weights=[1, 1, 1, 1, 1, 1, 2, 3, 5, 7, 8, 7, 6, 8, 9, 8, 7, 5, 4, 3, 2, 2, 1, 1],
+                        k=1
+                    )[0]
+                
+                hours.append(hour)
+            
+            # Create events for each request in this day
+            for i in range(day_requests):
+                # Generate timestamp with hour distribution
+                hour = hours[i]
+                minute = random.randint(0, 59)
+                second = random.randint(0, 59)
+                timestamp = event_date.replace(hour=hour, minute=minute, second=second).isoformat()
+                
+                # Select random parameters for this event
+                endpoint = random.choice(endpoints)
+                voice = random.choice(valid_voices)
+                user_agent = random.choice(user_agents)
+                status_code = random.choice(status_codes)
+                
+                # Determine length category and generate character counts
+                length_category = random.choices([0, 1, 2], weights=[0.5, 0.3, 0.2], k=1)[0]  # 50% short, 30% medium, 20% long
+                min_chars, max_chars = text_lengths[length_category]
+                character_count = random.randint(min_chars, max_chars)
+                
+                # Generate word count (approx 5 chars per word on average)
+                word_count = max(1, int(character_count / 5))
+                
+                # Generate processing time (varies by endpoint, length, and has some randomness)
+                base_processing_time = 50  # Base processing time in ms
+                length_factor = character_count / 50  # Scale by length
+                endpoint_factor = 1.0
+                if endpoint == "/v1/audio/transcriptions":
+                    endpoint_factor = 1.5  # Transcriptions are slower
+                elif endpoint == "/v1/audio/translations":
+                    endpoint_factor = 2.0  # Translations are even slower
+                
+                # Add some randomness (±30%)
+                random_factor = random.uniform(0.7, 1.3)
+                
+                # Calculate processing time
+                processing_time_ms = int(base_processing_time * length_factor * endpoint_factor * random_factor)
+                
+                # Calculate audio duration for speech endpoint
+                audio_duration_ms = None
+                if endpoint == "/v1/audio/speech":
+                    # Average of ~60ms per character for speech synthesis with some variation
+                    audio_duration_ms = int(character_count * random.uniform(55, 70))
+                
+                # Create event data
+                event_data = {
+                    "timestamp": timestamp,
+                    "request_type": request_type,
+                    "endpoint": endpoint,
+                    "http_method": "POST",
+                    "status_code": status_code,
+                    "character_count": character_count,
+                    "word_count": word_count,
+                    "processing_time_ms": processing_time_ms,
+                    "user_id": user_id,
+                    "request_id": str(uuid.uuid4()),
+                    "user_agent": user_agent,
+                    "metadata": {
+                        "model": "tts-1" if endpoint == "/v1/audio/speech" else "whisper-1",
+                        "format": "mp3" if endpoint == "/v1/audio/speech" else "wav"
+                    }
+                }
+                
+                # Add subscription ID if provided
+                if subscription_id:
+                    event_data["subscription_id"] = subscription_id
+                
+                # Add voice ID for speech requests
+                if endpoint == "/v1/audio/speech":
+                    event_data["voice_id"] = voice
+                    event_data["audio_duration_ms"] = audio_duration_ms
+                
+                # Insert the event
+                response = supabase.table("usage_events").insert(event_data).execute()
+                
+                if response.data:
+                    event_id = response.data[0]["id"]
+                    created_ids.append(event_id)
+                    test_data["usage_events"].append(event_id)
+                else:
+                    print(f"Failed to create event {i+1} for {date_str}")
+            
+            print(f"Created {len(created_ids)} events so far...")
+        
+        # Save IDs for cleanup
+        save_test_data_ids(test_data)
+        print(f"Successfully created {len(created_ids)} pattern-based events over {days} days")
+        return created_ids
+        
+    except Exception as e:
+        print(f"Error creating usage pattern events: {e}")
+        traceback.print_exc()
+        return created_ids
+
+
+def create_voice_comparison_events(user_id, subscription_id=None, sample_text=None):
+    """Create usage events that compare all available voices with the same text
+    
+    This helps generate data for comparing voice performance metrics.
+    
+    Args:
+        user_id: User ID for events
+        subscription_id: Subscription ID for paid tier events
+        sample_text: Optional specific text to use for all events
+        
+    Returns:
+        list: List of created usage event IDs
+    """
+    test_data = load_test_data_ids()
+    
+    if "usage_events" not in test_data:
+        test_data["usage_events"] = []
+    
+    # Default sample text if none provided
+    if not sample_text:
+        sample_text = "This is a sample text to test different voices and measure their performance. It includes a variety of sounds and phonemes to provide a good benchmark for comparison."
+    
+    character_count = len(sample_text)
+    word_count = len(sample_text.split())
+    
+    # Determine request type
+    request_type = "paid" if subscription_id else "free"
+    
+    # Fetch valid voice IDs from the database
+    try:
+        voices_response = supabase.table("voices").select("voice_id").execute()
+        if not voices_response.data:
+            print("Error: No voices found in the database. Please run migrations first.")
+            return []
+            
+        valid_voices = [voice["voice_id"] for voice in voices_response.data]
+        print(f"Found {len(valid_voices)} valid voices in the database for comparison events")
+        
+        # Limit to 10 voices to avoid too many events
+        if len(valid_voices) > 10:
+            valid_voices = random.sample(valid_voices, 10)
+        
+    except Exception as e:
+        print(f"Error fetching voices: {e}")
+        return []
+    
+    created_ids = []
+    timestamp = datetime.datetime.utcnow().isoformat()
+    
+    try:
+        print(f"Creating voice comparison events for {len(valid_voices)} voices...")
+        
+        for voice in valid_voices:
+            # Create processing time that varies by voice (some voices are faster)
+            # This simulates real-world differences in voice processing speed
+            if voice.startswith(("am_", "bm_")):
+                # Male voices are "faster" in this simulation
+                processing_time = random.randint(100, 300)
+            elif voice.startswith(("af_", "bf_")):
+                # Female voices are "medium" speed in this simulation
+                processing_time = random.randint(300, 500)
+            else:
+                # Non-English voices are "slower" in this simulation
+                processing_time = random.randint(500, 800)
+            
+            # Audio duration also varies slightly by voice
+            duration_factor = random.uniform(0.9, 1.1)  # +/- 10% variation
+            audio_duration_ms = int(character_count * 65 * duration_factor)  # ~65ms per character as base
+            
+            # Create the event
+            event_data = {
+                "timestamp": timestamp,
+                "request_type": request_type,
+                "endpoint": "/v1/audio/speech",
+                "http_method": "POST",
+                "status_code": 200,
+                "character_count": character_count,
+                "word_count": word_count,
+                "voice_id": voice,
+                "processing_time_ms": processing_time,
+                "audio_duration_ms": audio_duration_ms,
+                "user_id": user_id,
+                "request_id": str(uuid.uuid4()),
+                "user_agent": "Voice Comparison Test",
+                "metadata": {
+                    "format": "mp3",
+                    "model": "tts-1",
+                    "comparison_test": True,
+                    "sample_text": sample_text[:100] + "..." if len(sample_text) > 100 else sample_text
+                }
+            }
+            
+            # Add subscription ID if provided
+            if subscription_id:
+                event_data["subscription_id"] = subscription_id
+            
+            # Insert the event
+            response = supabase.table("usage_events").insert(event_data).execute()
+            
+            if response.data:
+                event_id = response.data[0]["id"]
+                created_ids.append(event_id)
+                test_data["usage_events"].append(event_id)
+                print(f"Created comparison event for voice '{voice}': {event_id}")
+            else:
+                print(f"Failed to create comparison event for voice '{voice}'")
+        
+        # Save IDs for cleanup
+        save_test_data_ids(test_data)
+        return created_ids
+        
+    except Exception as e:
+        print(f"Error creating voice comparison events: {e}")
+        return created_ids
+
+
 def cleanup_test_data():
-    """Clean up all test data"""
+    """Clean up all test data created by this script"""
     test_data = load_test_data_ids()
 
     print("Cleaning up test data...")
@@ -859,6 +1314,21 @@ def cleanup_test_data():
                 print(f"Deleted Stripe customer: {customer_id}")
             except Exception as e:
                 print(f"Error cleaning up Stripe customer {customer_id}: {e}")
+
+    # Add cleanup for usage events
+    try:
+        if "usage_events" in test_data and test_data["usage_events"]:
+            print(f"Deleting {len(test_data['usage_events'])} usage events...")
+            for usage_event_id in test_data["usage_events"]:
+                try:
+                    supabase.table("usage_events").delete().eq("id", usage_event_id).execute()
+                except Exception as e:
+                    print(f"Error deleting usage event {usage_event_id}: {e}")
+            
+            test_data["usage_events"] = []
+            save_test_data_ids(test_data)
+    except Exception as e:
+        print(f"Error cleaning up usage events: {e}")
 
     # Reset test data using the default structure
     # We'll use the load_test_data_ids function to get a fresh default structure
@@ -1042,6 +1512,47 @@ def create_test_data():
         period_end = (now + datetime.timedelta(days=30)).isoformat()
         free_usage_id = create_free_usage_record(free_user_id, period_start, period_end)
         print(f"Free usage record created: {free_usage_id}")
+
+    # Create usage events for analytics
+    print("\n--- Creating Sample Usage Events ---")
+    
+    if free_user_id:
+        print(f"Creating usage events for free tier user {free_user_id}...")
+        free_events = create_usage_events(user_id=free_user_id, count=10)
+        print(f"Created {len(free_events)} usage events for free tier user")
+    
+    if premium_subscription_id and premium_user_id:
+        print(f"Creating usage events for premium tier subscription {premium_subscription_id}...")
+        premium_events = create_usage_events(
+            user_id=premium_user_id, 
+            subscription_id=premium_subscription_id, 
+            count=15)
+        print(f"Created {len(premium_events)} usage events for premium tier")
+    
+    # Create demo events with a sample IP
+    demo_ip = "192.168.1.100"
+    print(f"Creating usage events for demo tier (IP: {demo_ip})...")
+    demo_events = create_usage_events(ip_address=demo_ip, count=5)
+    print(f"Created {len(demo_events)} usage events for demo tier")
+
+    # Create pattern-based events for analytics testing
+    if premium_user_id and premium_subscription_id:
+        print(f"\n--- Creating Pattern-Based Usage Events ---")
+        print(f"Creating usage pattern for premium user {premium_user_id}...")
+        premium_pattern = create_usage_pattern_events(
+            user_id=premium_user_id,
+            subscription_id=premium_subscription_id,
+            days=14,  # Two weeks of data
+            requests_per_day=20  # ~20 requests per day
+        )
+        
+        # Create voice comparison data for analytics
+        print(f"\n--- Creating Voice Comparison Events ---")
+        voice_comparison = create_voice_comparison_events(
+            user_id=premium_user_id,
+            subscription_id=premium_subscription_id
+        )
+        print(f"Created {len(voice_comparison)} voice comparison events")
 
     # Print test data for use in testing
     print("\n=== Test Data for API Testing ===")

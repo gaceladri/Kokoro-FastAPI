@@ -1,9 +1,11 @@
 import asyncio
 import re
+import ssl
 import time
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import stripe
 from fastapi import Request
@@ -53,121 +55,436 @@ def parse_iso_datetime(date_string: str) -> datetime:
         return datetime.utcnow()
 
 
-class UsageTrackingService:
-    """Service for tracking TTS usage."""
+class ApiKeyCacheManager:
+    """Manager for API key validation caching to reduce database load."""
 
-    def __init__(self):
-        """Initialize usage tracking service."""
-        self._supabase = None  # Will be initialized in create()
-        self._demo_cache = defaultdict(list)  # IP -> List[timestamp]
-        self._last_cleanup = time.time()
-        self._cache_lock = asyncio.Lock()
-        self._stripe_reporting_lock = asyncio.Lock()  # Add lock for Stripe reporting
-        self._demo_user_id = None  # Cached demo user ID
+    def __init__(self, refresh_interval: int = 300):
+        """Initialize the API key cache manager.
 
-    @classmethod
-    async def create(cls) -> "UsageTrackingService":
-        """Create and initialize usage tracking service."""
-        service = cls()
-        # Initialize Supabase client
-        service._supabase = await SupabaseClient.get_instance()
-        # Initialize the demo user if usage tracking is enabled
-        if settings.enable_usage_tracking:
-            await service._ensure_demo_user_exists()
-        return service
-
-    async def _ensure_demo_user_exists(self) -> str:
-        """Ensure a demo user exists for tracking demo usage.
-
-        Returns:
-            str: UUID of the demo user, or None if creation failed
+        Args:
+            refresh_interval: Interval in seconds for cache refresh (default 5 minutes)
         """
-        if self._demo_user_id:
-            # Verify that the cached user ID actually exists in the database
-            user_exists = await self._verify_user_exists(self._demo_user_id)
-            if user_exists:
-                return self._demo_user_id
-            else:
-                logger.warning(
-                    f"Cached demo user ID {self._demo_user_id} does not exist in database - will recreate"
-                )
-                self._demo_user_id = None  # Reset the cached ID since it's invalid
+        self._api_keys = {}  # prefix -> key info
+        self._free_users = {}  # user_id -> user info
+        self._refresh_interval = refresh_interval
+        self._supabase = None
+        self._refresh_lock = asyncio.Lock()
+        self._last_refresh = 0
+        self._demo_user_cache = {}  # Cache for demo users - lasts 1 hour
+        self._demo_user_cache_ttl = 3600
+        self._initialized = False  # Flag to track initialization state
 
-        # Check if the demo user already exists
+        # Performance metrics
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._last_db_operation_time = 0
+        self._db_operation_count = 0
+        self._validation_cache = {}  # Additional validation result cache
+
+        # For scheduled refresh
+        self._refresh_task = None
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get cache performance metrics."""
+        now = time.time()
+        time_window = now - self._last_metrics_reset
+
+        return {
+            "cache_size": len(self._api_keys),
+            "cache_hits": self._cache_hits,
+            "cache_misses": self._cache_misses,
+            "hit_rate": (self._cache_hits / (self._cache_hits + self._cache_misses))
+            if (self._cache_hits + self._cache_misses) > 0
+            else 0,
+            "time_since_last_reset": f"{time_window:.1f}s",
+            "time_since_last_refresh": f"{(now - self._last_refresh):.1f}s",
+            "last_refresh_success": self._last_refresh_success,
+        }
+
+    def reset_metrics(self):
+        """Reset cache metrics."""
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._last_metrics_reset = time.time()
+
+    async def initialize(self):
+        """Initialize the cache and start the refresh task."""
+        if self._initialized:
+            return
+
+        self._supabase = await SupabaseClient.get_instance()
+
+        # Perform initial cache refresh
+        await self.refresh_cache()
+
+        # Start the background refresh task
+        self._refresh_task = asyncio.create_task(self._refresh_loop())
+        self._initialized = True
+
+    async def _refresh_loop(self):
+        """Background task to periodically refresh the cache."""
+        while True:
+            try:
+                await asyncio.sleep(self._refresh_interval)
+                await self.refresh_cache()
+            except asyncio.CancelledError:
+                logger.info("API key cache refresh task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in API key cache refresh loop: {e}")
+                await asyncio.sleep(5)  # Wait a bit before retrying
+
+    async def refresh_cache(self):
+        """Refresh the API key and user data cache from Supabase."""
         try:
+            async with self._refresh_lock:
+                if not self._supabase:
+                    logger.warning(
+                        "Cannot refresh API key cache: Supabase client not initialized"
+                    )
+                    self._last_refresh_success = False
+                    return
+
+                start_time = time.time()
+                logger.debug("Refreshing API key cache...")
+
+                # Load all active API keys in a single query
+                query = (
+                    self._supabase._client.table("api_keys")
+                    .select("*, users(*)")
+                    .eq("is_active", True)
+                )
+
+                response = await query.execute()
+
+                if not response.data:
+                    logger.warning("No active API keys found in database")
+                    self._api_keys = {}  # Clear cache
+                    return
+
+                # Process API keys and build cache
+                new_cache = {}
+                subscription_cache = {}  # Temporary cache to avoid duplicate subscription queries
+                self._active_user_ids = set()  # Reset the active user IDs set
+
+                for key_data in response.data:
+                    try:
+                        key_prefix = key_data.get("key_prefix")
+                        user_id = key_data.get("user_id")
+
+                        if not key_prefix or not user_id:
+                            continue
+
+                        # Add to active user IDs for free tier tracking
+                        self._active_user_ids.add(user_id)
+
+                        # Get subscription (from cache if possible)
+                        subscription = subscription_cache.get(user_id)
+                        if not subscription:
+                            subscription = await self._get_active_subscription(user_id)
+                            if subscription:
+                                subscription_cache[user_id] = subscription
+                            else:
+                                continue  # Skip keys without active subscription
+
+                        # Get current period usage
+                        period_start = parse_iso_datetime(
+                            subscription["current_period_start"]
+                        )
+                        period_end = parse_iso_datetime(
+                            subscription["current_period_end"]
+                        )
+
+                        usage = await self._get_subscription_usage(
+                            subscription["id"], period_start, period_end
+                        )
+
+                        # Store in cache
+                        new_cache[key_prefix] = {
+                            "timestamp": time.time(),
+                            "info": {
+                                "user": key_data["users"],
+                                "subscription": subscription,
+                                "usage": usage
+                                or {
+                                    "total_requests": 0,
+                                    "characters_used": 0,
+                                    "last_request_at": None,
+                                },
+                            },
+                        }
+
+                    except Exception as e:
+                        logger.error(
+                            f"Error processing API key {key_data.get('key_prefix')}: {e}"
+                        )
+
+                # Replace the cache atomically
+                self._api_keys = new_cache
+
+                # Now load free users data
+                await self._load_free_users()
+
+                self._last_refresh = time.time()
+                self._last_refresh_success = True
+                refresh_time = time.time() - start_time
+                logger.info(
+                    f"API key cache refreshed in {refresh_time:.2f}s - {len(self._api_keys)} keys cached, {len(self._free_users)} free users cached"
+                )
+        except Exception as e:
+            self._last_refresh_success = False
+            logger.error(f"Failed to refresh API key cache: {e}")
+
+    async def _load_api_keys(self):
+        """Load all active API keys from Supabase."""
+        try:
+            if not self._supabase or not self._supabase._client:
+                return
+
+            # Query all active API keys with user info
             query = (
-                self._supabase._client.table("users")
-                .select("id")
-                .eq("email", "demo@kokoro.ai")
+                self._supabase._client.table("api_keys")
+                .select("*, users(*)")
+                .eq("is_active", True)
             )
 
-            result = await query.execute()
+            response = await query.execute()
 
-            if result.data and len(result.data) > 0:
-                self._demo_user_id = result.data[0]["id"]
-                logger.info(f"Using existing demo user with ID: {self._demo_user_id}")
+            if not response.data:
+                logger.warning("No active API keys found in database")
+                return
 
-                # Double-check that this user ID is actually valid
-                user_exists = await self._verify_user_exists(self._demo_user_id)
-                if not user_exists:
-                    logger.warning(
-                        f"Demo user ID {self._demo_user_id} from query doesn't actually exist - will recreate"
+            # Process API keys
+            new_keys = {}
+            for key_data in response.data:
+                try:
+                    # Extract key prefix and user ID
+                    key_prefix = key_data.get("key_prefix")
+                    user_id = key_data.get("user_id")
+
+                    if not key_prefix or not user_id:
+                        continue
+
+                    # For effective caching, we need a more unique identifier than just 8 chars
+                    # Instead, use a combination of user_id and key_prefix to ensure uniqueness
+                    # This is a temporary solution until the database schema is updated
+                    cache_key = f"{key_prefix}_{user_id[:8]}"
+
+                    # Track user ID as active
+                    self._active_user_ids.add(user_id)
+
+                    # Get user's active subscription
+                    subscription = await self._get_active_subscription(user_id)
+                    if not subscription:
+                        # Skip keys without active subscription
+                        continue
+
+                    # Get current period usage
+                    period_start = parse_iso_datetime(
+                        subscription["current_period_start"]
                     )
-                    self._demo_user_id = None
-                else:
-                    return self._demo_user_id
+                    period_end = parse_iso_datetime(subscription["current_period_end"])
 
-            # Create the demo user if it doesn't exist or is invalid
-            demo_user = {"email": "demo@kokoro.ai", "full_name": "Demo User"}
+                    usage = await self._get_subscription_usage(
+                        subscription["id"], period_start, period_end
+                    )
 
-            insert_query = self._supabase._client.table("users").insert(demo_user)
-            result = await insert_query.execute()
+                    # Store key with all relevant data
+                    new_keys[cache_key] = {
+                        "timestamp": time.time(),
+                        "info": {
+                            "user": key_data["users"],
+                            "subscription": subscription,
+                            "usage": usage,
+                        },
+                    }
 
-            if result.data and len(result.data) > 0:
-                self._demo_user_id = result.data[0]["id"]
-                logger.info(f"Created demo user with ID: {self._demo_user_id}")
-
-                # Verify one more time
-                user_exists = await self._verify_user_exists(self._demo_user_id)
-                if not user_exists:
+                except Exception as e:
                     logger.error(
-                        f"Newly created demo user {self._demo_user_id} doesn't exist immediately after creation"
+                        f"Error processing API key {key_data.get('key_prefix')}: {e}"
                     )
-                    self._demo_user_id = None
 
-                return self._demo_user_id
-            else:
-                logger.error("Failed to create demo user")
-                return None
+            # Replace the cache with new data
+            self._api_keys = new_keys
 
         except Exception as e:
-            logger.error(f"Error ensuring demo user exists: {e}")
+            logger.error(f"Error loading API keys: {e}")
+
+    async def _load_free_users(self):
+        """Load usage data for active free tier users."""
+        try:
+            if not self._supabase or not self._supabase._client:
+                return
+
+            if not self._active_user_ids:
+                return
+
+            # Get current month boundaries
+            now = datetime.utcnow()
+            period_start = datetime(now.year, now.month, 1)
+            if now.month < 12:
+                period_end = datetime(now.year, now.month + 1, 1) - timedelta(seconds=1)
+            else:
+                period_end = datetime(now.year + 1, 1, 1) - timedelta(seconds=1)
+
+            new_free_users = {}
+
+            # Query free_usage table for active users
+            for user_id in self._active_user_ids:
+                try:
+                    query = (
+                        self._supabase._client.table("free_usage")
+                        .select("*")
+                        .eq("user_id", user_id)
+                        .eq("period_start", period_start.isoformat())
+                        .limit(1)
+                    )
+
+                    result = await query.execute()
+
+                    usage = None
+                    if result.data and len(result.data) > 0:
+                        usage = result.data[0]
+                    else:
+                        # No usage record yet, create empty one
+                        usage = {
+                            "total_requests": 0,
+                            "characters_used": 0,
+                            "last_request_at": None,
+                            "period_start": period_start.isoformat(),
+                            "period_end": period_end.isoformat(),
+                        }
+
+                    new_free_users[user_id] = {
+                        "timestamp": time.time(),
+                        "usage": usage,
+                        "period_start": period_start,
+                        "period_end": period_end,
+                    }
+
+                except Exception as e:
+                    logger.error(f"Error loading free user data for {user_id}: {e}")
+
+            # Update the free users cache
+            self._free_users = new_free_users
+
+        except Exception as e:
+            logger.error(f"Error loading free users data: {e}")
+
+    async def _get_active_subscription(self, user_id: str) -> Optional[Dict]:
+        """Get active subscription for a user directly from Supabase."""
+        try:
+            if not self._supabase or not self._supabase._client:
+                return None
+
+            # Query active subscription with product info
+            query = (
+                self._supabase._client.table("subscriptions")
+                .select("*, products(*)")
+                .eq("user_id", user_id)
+                .eq("status", "active")
+                .limit(1)
+            )
+
+            response = await query.execute()
+
+            if not response.data or len(response.data) == 0:
+                return None
+
+            return response.data[0]
+
+        except Exception as e:
+            logger.error(f"Error getting active subscription for user {user_id}: {e}")
             return None
 
-    async def _get_demo_user_id(self) -> str:
-        """Get the demo user ID, creating if necessary."""
-        if not self._demo_user_id:
-            return await self._ensure_demo_user_exists()
-        return self._demo_user_id
-
-    async def validate_request(
-        self,
-        api_key_prefix: str,
-        text_length: Optional[int] = None,
-    ) -> Tuple[bool, Optional[str], Optional[Dict]]:
-        """Validate a request using API key and subscription info."""
-        if not settings.enable_usage_tracking:
-            return True, None, None
-
+    async def _get_subscription_usage(
+        self, subscription_id: str, period_start: datetime, period_end: datetime
+    ) -> Dict:
+        """Get usage statistics for a subscription period directly from Supabase."""
         try:
-            # Validate API key
+            if not self._supabase or not self._supabase._client:
+                return {
+                    "total_requests": 0,
+                    "characters_used": 0,
+                    "last_request_at": None,
+                }
+
+            # Query usage for period
+            query = (
+                self._supabase._client.table("usage")
+                .select("*")
+                .eq("subscription_id", subscription_id)
+                .eq("period_start", period_start.isoformat())
+                .limit(1)
+            )
+
+            response = await query.execute()
+
+            if not response.data or len(response.data) == 0:
+                return {
+                    "total_requests": 0,
+                    "characters_used": 0,
+                    "last_request_at": None,
+                    "period_start": period_start.isoformat(),
+                    "period_end": period_end.isoformat(),
+                    "reported_to_stripe": False,
+                }
+
+            return response.data[0]
+
+        except Exception as e:
+            logger.error(f"Error getting usage for subscription {subscription_id}: {e}")
+            return {
+                "total_requests": 0,
+                "characters_used": 0,
+                "last_request_at": None,
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat(),
+                "reported_to_stripe": False,
+            }
+
+    async def validate_api_key(
+        self, api_key_prefix: str, text_length: Optional[int] = None
+    ) -> Tuple[bool, Optional[str], Optional[Dict]]:
+        """Validate an API key using the cache, falling back to database if needed."""
+        validation_start = time.time()
+
+        # Check if we have a cached entry
+        async with self._refresh_lock:
+            cached_info = self._api_keys.get(api_key_prefix)
+            if cached_info:
+                self._cache_hits += 1
+                cache_time = time.time() - validation_start
+                logger.info(
+                    f"API key validation from cache took {cache_time:.4f}s (Hit rate: {self.get_metrics()['hit_rate']:.1%})"
+                )
+                return self._validate_cached_key_info(cached_info, text_length)
+
+            self._cache_misses += 1
+
+        # Cache miss - fall back to database validation
+        logger.warning(
+            f"API key cache miss for {api_key_prefix}, falling back to database (Hit rate: {self.get_metrics()['hit_rate']:.1%})"
+        )
+        try:
+            if not self._supabase:
+                return False, "Database unavailable", None
+
+            # Validate using database
+            db_start = time.time()
             api_key_info = await self._supabase.validate_api_key(api_key_prefix)
+            db_key_time = time.time() - db_start
+            logger.info(f"API key database lookup took {db_key_time:.4f}s")
+
             if not api_key_info:
                 return False, "Invalid API key", None
 
             # Get user's active subscription
+            sub_start = time.time()
             user_id = api_key_info["user_id"]
-            subscription = await self._supabase.get_active_subscription(user_id)
+            subscription = await self._get_active_subscription(user_id)
+            sub_time = time.time() - sub_start
+            logger.info(f"Subscription lookup took {sub_time:.4f}s")
 
             if not subscription:
                 return False, "No active subscription found", None
@@ -181,22 +498,234 @@ class UsageTrackingService:
                 return False, "Subscription period expired", None
 
             # Get current period usage
-            usage = await self._supabase.get_period_usage(
+            usage_start = time.time()
+            usage = await self._get_subscription_usage(
                 subscription["id"], period_start, period_end
+            )
+            usage_time = time.time() - usage_start
+            logger.info(f"Usage lookup took {usage_time:.4f}s")
+
+            # Create request info
+            request_info = {
+                "user": api_key_info["users"],
+                "subscription": subscription,
+                "usage": usage
+                or {
+                    "total_requests": 0,
+                    "characters_used": 0,
+                    "last_request_at": None,
+                },
+            }
+
+            # Cache the result
+            async with self._refresh_lock:
+                self._api_keys[api_key_prefix] = {
+                    "timestamp": time.time(),
+                    "info": request_info,
+                }
+
+            total_time = time.time() - validation_start
+            logger.info(f"Total API key validation took {total_time:.4f}s")
+
+            return True, None, request_info
+
+        except Exception as e:
+            logger.error(f"Error validating API key: {e}")
+            return False, str(e), None
+
+    async def validate_free_tier_request(
+        self, user_id: str, text_length: Optional[int] = None
+    ) -> Tuple[bool, Optional[str], Optional[Dict]]:
+        """Validate a request for a free tier user using cache when possible.
+
+        Args:
+            user_id: User ID for free tier validation
+            text_length: Length of text to validate against limits (optional)
+
+        Returns:
+            Tuple of (is_valid, error_message, context)
+        """
+        try:
+            if not self._initialized:
+                await self.initialize()
+
+            # Check cache
+            async with self._refresh_lock:
+                # Ensure _free_users is initialized
+                if not hasattr(self, "_free_users"):
+                    self._free_users = {}
+
+                cached_info = self._free_users.get(user_id)
+
+            if cached_info:
+                # We have cached info for this user
+                usage = cached_info["usage"]
+                period_start = cached_info["period_start"]
+                period_end = cached_info["period_end"]
+
+                # Check usage limits
+                if text_length is not None:
+                    current_characters = usage.get("characters_used", 0)
+                    free_tier_limit = settings.free_tier_character_limit
+
+                    if current_characters + text_length > free_tier_limit:
+                        return (
+                            False,
+                            f"Free tier character limit would be exceeded (limit: {free_tier_limit})",
+                            None,
+                        )
+
+                # Return cached info
+                return (
+                    True,
+                    None,
+                    {
+                        "user_id": user_id,
+                        "usage": usage,
+                        "period_start": period_start,
+                        "period_end": period_end,
+                    },
+                )
+
+            # Cache miss - fall back to database validation
+            logger.warning(
+                f"Free tier cache miss for {user_id}, falling back to database"
+            )
+
+            # Get current month's boundaries
+            now = datetime.utcnow()
+            period_start = datetime(now.year, now.month, 1)
+            if now.month < 12:
+                period_end = datetime(now.year, now.month + 1, 1) - timedelta(seconds=1)
+            else:
+                period_end = datetime(now.year + 1, 1, 1) - timedelta(seconds=1)
+
+            # Get free tier usage from database
+            if not self._supabase:
+                return False, "Database unavailable", None
+
+            usage = await self._supabase.get_free_tier_usage(
+                user_id, period_start, period_end
             )
 
             # Check usage limits
+            if text_length is not None:
+                current_characters = usage.get("characters_used", 0) if usage else 0
+                free_tier_limit = settings.free_tier_character_limit
+
+                if current_characters + text_length > free_tier_limit:
+                    return (
+                        False,
+                        f"Free tier character limit would be exceeded (limit: {free_tier_limit})",
+                        None,
+                    )
+
+            # Create context
+            context = {
+                "user_id": user_id,
+                "usage": usage,
+                "period_start": period_start,
+                "period_end": period_end,
+            }
+
+            # Ensure _active_user_ids is initialized
+            if not hasattr(self, "_active_user_ids"):
+                self._active_user_ids = set()
+
+            # Update cache for future requests
+            async with self._refresh_lock:
+                self._free_users[user_id] = {
+                    "timestamp": time.time(),
+                    "usage": usage,
+                    "period_start": period_start,
+                    "period_end": period_end,
+                }
+                self._active_user_ids.add(user_id)
+
+            return True, None, context
+
+        except Exception as e:
+            logger.error(f"Failed to validate free tier request: {e}")
+            return False, "Internal server error", None
+
+    def get_status(self) -> Dict:
+        """Get the current status of the cache manager.
+
+        Returns:
+            Dict with status information
+        """
+        return {
+            "initialized": self._initialized,
+            "api_keys_cached": len(self._api_keys),
+            "free_users_cached": len(self._free_users),
+            "active_users_tracked": len(self._active_user_ids),
+            "last_refresh": self._last_refresh,
+            "last_refresh_success": self._last_refresh_success,
+            "refresh_interval": self._refresh_interval,
+        }
+
+    async def shutdown(self):
+        """Clean up resources when shutting down."""
+        if self._refresh_task:
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+
+        logger.info("API key cache manager shut down")
+
+    def _validate_cached_key_info(
+        self, cached_info: Dict, text_length: Optional[int] = None
+    ) -> Tuple[bool, Optional[str], Optional[Dict]]:
+        """Validate cached key information against request limitations.
+
+        Args:
+            cached_info: The cached key information
+            text_length: Length of text to validate against usage limits (optional)
+
+        Returns:
+            Tuple of (is_valid, error_message, request_info)
+        """
+        request_info = cached_info["info"]
+
+        # Check if subscription is active
+        subscription = request_info["subscription"]
+        now = datetime.utcnow()
+
+        # Ensure subscription has required fields
+        if (
+            "current_period_start" not in subscription
+            or "current_period_end" not in subscription
+        ):
+            logger.warning("Cached subscription missing period start/end fields")
+            return False, "Invalid subscription data", None
+
+        period_start = parse_iso_datetime(subscription["current_period_start"])
+        period_end = parse_iso_datetime(subscription["current_period_end"])
+
+        if now < period_start or now > period_end:
+            return False, "Subscription period expired", None
+
+        # Check usage limits if text length is provided
+        if text_length is not None:
+            usage = request_info["usage"]
+
+            # Ensure products exists in subscription
+            if "products" not in subscription:
+                logger.warning("Cached subscription missing products field")
+                return False, "Invalid subscription data", None
+
             product = subscription["products"]
             current_requests = usage["total_requests"] if usage else 0
             current_characters = usage.get("characters_used", 0) if usage else 0
 
             # Check request limit for all plans
-            if product["monthly_request_limit"] is not None:
+            if product.get("monthly_request_limit") is not None:
                 if current_requests >= product["monthly_request_limit"]:
                     return False, "Monthly request limit exceeded", None
 
             # For premium plan with metered billing, don't enforce a strict character limit
-            # as it will be billed as overage instead of being rejected
             is_premium = product.get("stripe_metered_price_id") is not None
 
             # Only enforce character limit for non-premium plans if a limit is set
@@ -209,22 +738,280 @@ class UsageTrackingService:
                 if current_characters + text_length > character_limit:
                     return False, "Monthly character limit would be exceeded", None
 
-            return (
-                True,
-                None,
-                {
-                    "user": api_key_info["users"],
-                    "subscription": subscription,
-                    "usage": usage,
-                },
+        # Validation passed
+        return True, None, request_info
+
+
+class UsageTrackingService:
+    """Service for tracking TTS usage."""
+
+    # Class-level variables for caching and shared state
+    _key_cache_manager = None
+    _key_cache_init_lock = asyncio.Lock()
+    _demo_user_id = None  # Cached demo user ID at class level
+    _demo_user_lock = asyncio.Lock()
+    _event_queue = asyncio.Queue(maxsize=1000)
+    _validation_cache = {}  # Cache for validation results
+    _is_queue_processor_running = False
+    _queue_processor_lock = asyncio.Lock()
+
+    def __init__(self):
+        """Initialize usage tracking service."""
+        self._supabase = None  # Will be initialized in create()
+        self._demo_cache = defaultdict(list)  # IP -> List[timestamp]
+        self._last_cleanup = time.time()
+        self._cache_lock = asyncio.Lock()
+        self._stripe_reporting_lock = asyncio.Lock()  # Add lock for Stripe reporting
+        self._last_tracking_error_time = 0
+        self._tracking_error_count = 0
+        self._last_batch_flush = time.time()
+        self._ssl_context = None  # Will be initialized in create()
+
+    @classmethod
+    async def create(cls) -> "UsageTrackingService":
+        """Create and initialize usage tracking service."""
+        service = cls()
+
+        # Initialize Supabase client with proper SSL context
+        service._ssl_context = ssl.create_default_context()
+        service._ssl_context.check_hostname = True
+        service._ssl_context.verify_mode = ssl.CERT_REQUIRED
+
+        # Initialize Supabase client
+        service._supabase = await SupabaseClient.get_instance()
+
+        # Initialize the demo user if usage tracking is enabled
+        if settings.enable_usage_tracking:
+            # Start the background event processor
+            asyncio.create_task(service._start_event_processor())
+
+            # Asynchronously initialize demo user without blocking
+            asyncio.create_task(service._ensure_demo_user_exists())
+
+        # Initialize API key cache manager with longer refresh interval
+        await cls._get_key_cache_manager()
+
+        return service
+
+    @classmethod
+    async def _get_key_cache_manager(cls) -> ApiKeyCacheManager:
+        """Get or create the API key cache manager with extended cache TTL."""
+        async with cls._key_cache_init_lock:
+            if cls._key_cache_manager is None:
+                # Create and initialize the cache manager with longer refresh interval
+                cls._key_cache_manager = ApiKeyCacheManager(
+                    refresh_interval=300  # Refresh every 5 minutes instead of 30 seconds
+                )
+                await cls._key_cache_manager.initialize()
+
+        return cls._key_cache_manager
+
+    async def _start_event_processor(self):
+        """Start the background event processor if not already running."""
+        async with self._queue_processor_lock:
+            if self.__class__._is_queue_processor_running:
+                return
+
+            self.__class__._is_queue_processor_running = True
+
+        try:
+            # Process events in batches
+            while True:
+                try:
+                    # Wait for events to accumulate or timeout
+                    await asyncio.sleep(1.0)  # Check queue every second
+
+                    # Process events if we have enough or it's been too long
+                    current_time = time.time()
+                    queue_size = self.__class__._event_queue.qsize()
+
+                    if queue_size >= 10 or (
+                        queue_size > 0 and current_time - self._last_batch_flush > 5
+                    ):
+                        # Get events from queue (up to 50)
+                        events = []
+                        for _ in range(min(50, queue_size)):
+                            try:
+                                events.append(self.__class__._event_queue.get_nowait())
+                            except asyncio.QueueEmpty:
+                                break
+
+                        if events:
+                            # Process the batch
+                            try:
+                                await self.track_usage_events_batch(events)
+                            except Exception as e:
+                                logger.error(f"Failed to process event batch: {e}")
+                            finally:
+                                # Mark tasks as done regardless of success
+                                for _ in range(len(events)):
+                                    self.__class__._event_queue.task_done()
+
+                        self._last_batch_flush = current_time
+
+                except Exception as e:
+                    logger.error(f"Error in event processor: {e}")
+                    await asyncio.sleep(5)  # Backoff on errors
+
+        except asyncio.CancelledError:
+            logger.info("Event processor task cancelled")
+        finally:
+            async with self._queue_processor_lock:
+                self.__class__._is_queue_processor_running = False
+
+    async def _ensure_demo_user_exists(self) -> str:
+        """Ensure a demo user exists for tracking demo usage with class-level caching."""
+        # First check if we already have the ID cached at class level
+        if self.__class__._demo_user_id:
+            return self.__class__._demo_user_id
+
+        # Use a lock to prevent multiple simultaneous DB operations
+        async with self.__class__._demo_user_lock:
+            # Double-check after acquiring lock
+            if self.__class__._demo_user_id:
+                return self.__class__._demo_user_id
+
+            # Check if the demo user already exists
+            try:
+                query = (
+                    self._supabase._client.table("users")
+                    .select("id")
+                    .eq("email", "demo@kokoro.ai")
+                )
+
+                result = await query.execute()
+
+                if result.data and len(result.data) > 0:
+                    self.__class__._demo_user_id = result.data[0]["id"]
+                    logger.info(
+                        f"Using existing demo user with ID: {self.__class__._demo_user_id}"
+                    )
+                    return self.__class__._demo_user_id
+
+                # Create the demo user if it doesn't exist
+                demo_user = {"email": "demo@kokoro.ai", "full_name": "Demo User"}
+
+                insert_query = self._supabase._client.table("users").insert(demo_user)
+                result = await insert_query.execute()
+
+                if result.data and len(result.data) > 0:
+                    self.__class__._demo_user_id = result.data[0]["id"]
+                    logger.info(
+                        f"Created demo user with ID: {self.__class__._demo_user_id}"
+                    )
+                    return self.__class__._demo_user_id
+                else:
+                    logger.error("Failed to create demo user")
+                    return None
+
+            except Exception as e:
+                logger.error(f"Error ensuring demo user exists: {e}")
+                return None
+
+    async def _get_demo_user_id(self) -> str:
+        """Get the demo user ID with efficient caching."""
+        # Use the class-level cached value if available
+        if self.__class__._demo_user_id:
+            return self.__class__._demo_user_id
+
+        # Try to ensure it exists (this will update the class-level cache)
+        return await self._ensure_demo_user_exists()
+
+    async def validate_request(
+        self,
+        api_key_prefix: str,
+        text_length: Optional[int] = None,
+    ) -> Tuple[bool, Optional[str], Optional[Dict]]:
+        """Validate a request using API key with caching."""
+        if not settings.enable_usage_tracking:
+            return True, None, None
+
+        try:
+            # Check cache first for this exact validation request
+            cache_key = f"{api_key_prefix}:{text_length or 0}"
+
+            # Return cached result if available and not expired
+            current_time = time.time()
+            if cache_key in self.__class__._validation_cache:
+                result, expiry = self.__class__._validation_cache[cache_key]
+                if current_time < expiry:
+                    return result
+
+            # Use the API key cache manager for validation
+            key_cache = await self._get_key_cache_manager()
+            result = await key_cache.validate_api_key(api_key_prefix, text_length)
+
+            # Cache the result for 5 minutes
+            self.__class__._validation_cache[cache_key] = (result, current_time + 300)
+
+            return result
+        except Exception as e:
+            logger.error(f"Error validating request: {e}")
+            # Cache the error result for a shorter time (30 seconds)
+            self.__class__._validation_cache[cache_key] = (
+                (True, None, None),
+                current_time + 30,
             )
+            return True, None, None  # Allow the request on validation errors
+
+    async def track_usage_event(
+        self,
+        request: Request,
+        endpoint: str,
+        http_method: str,
+        status_code: int,
+        character_count: int,
+        processing_time_ms: Optional[int] = None,
+        voice_id: Optional[str] = None,
+        audio_duration_ms: Optional[int] = None,
+        word_count: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Queue a usage event for background processing instead of blocking."""
+        if not self._should_track():
+            return True
+
+        try:
+            # Prepare the event data
+            event_data = {
+                "request": request,
+                "endpoint": endpoint,
+                "http_method": http_method,
+                "status_code": status_code,
+                "character_count": character_count,
+                "processing_time_ms": processing_time_ms,
+                "voice_id": voice_id,
+                "audio_duration_ms": audio_duration_ms,
+                "word_count": word_count,
+                "metadata": metadata,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+
+            # Don't block the main request - add to queue and return immediately
+            try:
+                # Try to add to queue with a short timeout
+                await asyncio.wait_for(
+                    self.__class__._event_queue.put(event_data), timeout=0.1
+                )
+
+                # Store the request ID on the request state for later reference
+                # This allows updates for streaming requests
+                request_id = str(uuid.uuid4())
+                if hasattr(request, "state"):
+                    request.state.tracked_request_id = request_id
+
+                return True
+            except asyncio.TimeoutError:
+                # If queue is full, log but don't block the request
+                logger.warning("Usage tracking queue is full, event dropped")
+                return False
 
         except Exception as e:
-            logger.error(f"Failed to validate request: {e}")
-            return False, "Internal server error", None
+            logger.error(f"Error queueing usage event: {e}")
+            return False
 
     async def _validate_api_key(
-        self, api_key: str
+        self, api_key: str, skip_limit_check: bool = False
     ) -> Tuple[bool, Optional[str], Optional[Dict]]:
         """Validate API key for compatibility with middleware.
 
@@ -233,18 +1020,23 @@ class UsageTrackingService:
 
         Args:
             api_key: Full API key
+            skip_limit_check: If True, skip validation against character limits
 
         Returns:
             Tuple containing validity, error message (if any), and info (if valid)
         """
-        # Extract the prefix (first 8 characters) from the full API key
-        api_key_prefix = api_key[:8] if api_key else ""
+        # Extract a longer prefix from the API key - use 16 chars instead of 8
+        # This makes it much more likely to be unique, even with common prefixes
+        api_key_prefix = api_key[:16] if api_key else ""
 
         if not api_key_prefix:
             return False, "Invalid API key format", None
 
         # Delegate to the validate_request method
-        return await self.validate_request(api_key_prefix)
+        # If skip_limit_check is True, we pass None for text_length to avoid limit checks
+        return await self.validate_request(
+            api_key_prefix, text_length=None if skip_limit_check else None
+        )
 
     async def validate_free_tier_request(
         self,
@@ -256,43 +1048,9 @@ class UsageTrackingService:
             return True, None, None
 
         try:
-            # Get current month's boundaries
-            now = datetime.utcnow()
-            period_start = datetime(now.year, now.month, 1)
-            if now.month < 12:
-                period_end = datetime(now.year, now.month + 1, 1) - timedelta(seconds=1)
-            else:
-                period_end = datetime(now.year + 1, 1, 1) - timedelta(seconds=1)
-
-            # Get free tier usage
-            usage = await self._supabase.get_free_tier_usage(
-                user_id, period_start, period_end
-            )
-
-            # Check usage limits
-            current_characters = usage.get("characters_used", 0) if usage else 0
-            free_tier_limit = settings.free_tier_character_limit
-
-            if text_length is not None and (
-                current_characters + text_length > free_tier_limit
-            ):
-                return (
-                    False,
-                    f"Free tier character limit would be exceeded (limit: {free_tier_limit})",
-                    None,
-                )
-
-            return (
-                True,
-                None,
-                {
-                    "user_id": user_id,
-                    "usage": usage,
-                    "period_start": period_start,
-                    "period_end": period_end,
-                },
-            )
-
+            # Use the API key cache manager for validation
+            key_cache = await self._get_key_cache_manager()
+            return await key_cache.validate_free_tier_request(user_id, text_length)
         except Exception as e:
             logger.error(f"Failed to validate free tier request: {e}")
             return False, "Internal server error", None
@@ -1074,6 +1832,201 @@ class UsageTrackingService:
             logger.error(error_msg)
             return [{"status": "global_error", "error": error_msg}]
 
+    def _should_track(self) -> bool:
+        """Determine if we should attempt tracking based on recent failures.
+
+        Implements backoff if there are repeated failures to prevent excessive logging
+        and improve performance when the tracking system is down.
+        """
+        if not settings.enable_usage_tracking or not self._supabase:
+            return False
+
+        # If no recent errors, always track
+        if self._tracking_error_count == 0:
+            return True
+
+        # Implement exponential backoff
+        current_time = time.time()
+        backoff_time = min(
+            30, 2 ** (self._tracking_error_count - 1)
+        )  # Max 30 seconds backoff
+
+        if current_time - self._last_tracking_error_time > backoff_time:
+            # It's been long enough since the last error, try again
+            return True
+
+        return False
+
+    def _record_tracking_error(self):
+        """Record a tracking error for backoff calculation."""
+        self._tracking_error_count = min(
+            10, self._tracking_error_count + 1
+        )  # Cap at 10 to avoid overflow
+        self._last_tracking_error_time = time.time()
+
+    def _record_tracking_success(self):
+        """Record a successful tracking operation."""
+        if self._tracking_error_count > 0:
+            self._tracking_error_count = 0
+
+    async def track_usage_events_batch(self, events: List[Dict[str, Any]]) -> bool:
+        """Track multiple usage events in a batch operation.
+
+        Args:
+            events: List of event data dictionaries
+
+        Returns:
+            bool: True if at least some events were tracked successfully
+        """
+        if not self._should_track():
+            return False
+
+        if not events:
+            return True  # No events to track is a success
+
+        try:
+            # Extract common fields from events for batch processing
+            batch_events = []
+
+            for event_data in events:
+                # Create a clean copy of the event data
+                processed_event = self._prepare_event_data(event_data)
+                if processed_event:
+                    batch_events.append(processed_event)
+
+            if not batch_events:
+                return True  # No valid events after processing
+
+            # Call the batch tracking method if the Supabase client supports it
+            if hasattr(self._supabase, "track_usage_events_batch"):
+                success = await self._supabase.track_usage_events_batch(batch_events)
+            else:
+                # Fall back to individual tracking if batch not supported
+                results = await asyncio.gather(
+                    *[
+                        self._supabase.track_usage_event(**event)
+                        for event in batch_events
+                    ],
+                    return_exceptions=True,
+                )
+                # If at least 50% were successful, consider it a success
+                success_count = sum(1 for r in results if r is True)
+                success = success_count >= len(batch_events) / 2
+
+            # Update tracking status based on result
+            if success:
+                self._record_tracking_success()
+                return True
+            else:
+                self._record_tracking_error()
+                return False
+
+        except Exception as e:
+            logger.error(f"Failed to track usage events batch: {e}")
+            self._record_tracking_error()
+            return False
+
+    def _prepare_event_data(
+        self, event_data: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Prepare event data for tracking, extracting needed info from the request.
+
+        Args:
+            event_data: Dictionary containing event data with a request object
+
+        Returns:
+            Optional[Dict]: Prepared event data for tracking or None if invalid
+        """
+        if not event_data:
+            return None
+
+        # Create a copy to avoid modifying the original
+        prepared_data = {}
+
+        # Extract request object
+        request = event_data.get("request")
+        if not request:
+            return None
+
+        # Copy simple fields directly
+        for key, value in event_data.items():
+            if key != "request" and value is not None:
+                prepared_data[key] = value
+
+        # Get request type from request state
+        request_type = getattr(request.state, "request_type", None)
+
+        # If request type is not set, determine it based on headers
+        if not request_type:
+            api_key = request.headers.get("X-API-Key")
+            user_id = request.headers.get("X-User-ID")
+
+            if api_key:
+                request_type = "paid"
+            elif user_id:
+                request_type = "free"
+            else:
+                request_type = "demo"
+
+        prepared_data["request_type"] = request_type
+
+        # Collect user identification based on request type
+        if request_type == "paid":
+            # Extract user and subscription from request state
+            user_info = getattr(request.state, "user", None)
+            subscription = getattr(request.state, "subscription", None)
+
+            if user_info:
+                prepared_data["user_id"] = user_info.get("id")
+
+            if subscription:
+                prepared_data["subscription_id"] = subscription.get("id")
+        elif request_type == "free":
+            # Extract user ID for free tier users
+            user_info = getattr(request.state, "user", None)
+            if user_info:
+                prepared_data["user_id"] = user_info.get("id")
+            else:
+                prepared_data["user_id"] = request.headers.get("X-User-ID")
+
+        # Always capture IP address for all request types
+        ip_address = getattr(request.state, "ip_address", None)
+        if not ip_address:
+            # Use X-Forwarded-For header if available
+            forwarded_for = request.headers.get("X-Forwarded-For")
+            if forwarded_for:
+                ip_address = forwarded_for.split(",")[0].strip()
+            else:
+                # Fallback to direct client address
+                ip_address = request.client.host
+
+        prepared_data["ip_address"] = ip_address
+
+        # Collect additional request metadata
+        prepared_data["user_agent"] = request.headers.get("User-Agent")
+        prepared_data["referrer"] = request.headers.get(
+            "Referer"
+        )  # Note the HTTP header spelling
+
+        # Build additional metadata for analytics
+        metadata = {}
+
+        # Add request headers that might be useful for analytics
+        tracking_headers = ["Accept", "Accept-Language", "Origin"]
+        for header in tracking_headers:
+            if header in request.headers:
+                metadata[header.lower()] = request.headers[header]
+
+        # Add any custom headers for tracking (X-* headers except sensitive ones)
+        for header, value in request.headers.items():
+            if header.startswith("X-") and header not in ["X-API-Key", "X-User-ID"]:
+                metadata[header.lower()] = value
+
+        if metadata:
+            prepared_data["metadata"] = metadata
+
+        return prepared_data
+
     async def track_usage_event(
         self,
         request: Request,
@@ -1082,93 +2035,254 @@ class UsageTrackingService:
         status_code: int,
         character_count: int,
         processing_time_ms: Optional[int] = None,
+        voice_id: Optional[str] = None,
+        audio_duration_ms: Optional[int] = None,
+        word_count: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Track a detailed usage event for time-series analytics.
-
-        Args:
-            request: FastAPI Request object
-            endpoint: API endpoint path
-            http_method: HTTP method (GET, POST, etc.)
-            status_code: HTTP status code
-            character_count: Number of characters processed
-            processing_time_ms: Request processing time in milliseconds
-
-        Returns:
-            bool: True if tracking successful, False otherwise
-        """
-        if not settings.enable_usage_tracking:
+        """Queue a usage event for background processing instead of blocking."""
+        if not self._should_track():
             return True
 
         try:
-            # Get request type from request state (set by middleware)
-            request_type = getattr(request.state, "request_type", None)
-
-            # If request type is not set, determine it based on headers
-            if not request_type:
-                api_key = request.headers.get("X-API-Key")
-                user_id = request.headers.get("X-User-ID")
-
-                if api_key:
-                    request_type = "paid"
-                elif user_id:
-                    request_type = "free"
-                else:
-                    request_type = "demo"
-
-            # Collect user identification based on request type
-            user_id = None
-            subscription_id = None
-            ip_address = None
-
-            if request_type == "paid":
-                # For paid tier
-                user = getattr(request.state, "user", None)
-                if user:
-                    user_id = user.get("id")
-
-                subscription = getattr(request.state, "subscription", None)
-                if subscription:
-                    subscription_id = subscription.get("id")
-
-            elif request_type == "free":
-                # For free tier
-                user = getattr(request.state, "user", None)
-                if user:
-                    user_id = user.get("id")
-                if not user_id:
-                    user_id = request.headers.get("X-User-ID")
-
-            else:
-                # For demo tier
-                ip_address = getattr(request.state, "ip_address", None)
-                if not ip_address:
-                    ip_address = request.client.host
-
-            # Collect additional metadata
-            metadata = {
-                "headers": dict(request.headers),
-                "query_params": dict(request.query_params),
-                "path_params": getattr(request, "path_params", {}),
+            # Prepare the event data
+            event_data = {
+                "request": request,
+                "endpoint": endpoint,
+                "http_method": http_method,
+                "status_code": status_code,
+                "character_count": character_count,
+                "processing_time_ms": processing_time_ms,
+                "voice_id": voice_id,
+                "audio_duration_ms": audio_duration_ms,
+                "word_count": word_count,
+                "metadata": metadata,
+                "timestamp": datetime.utcnow().isoformat(),
             }
 
-            # Get user agent
-            user_agent = request.headers.get("User-Agent")
+            # Don't block the main request - add to queue and return immediately
+            try:
+                # Try to add to queue with a short timeout
+                await asyncio.wait_for(
+                    self.__class__._event_queue.put(event_data), timeout=0.1
+                )
 
-            # Track the event
-            return await self._supabase.track_usage_event(
-                endpoint=endpoint,
-                http_method=http_method,
-                status_code=status_code,
-                character_count=character_count,
-                request_type=request_type,
-                user_id=user_id,
-                subscription_id=subscription_id,
-                ip_address=ip_address,
-                processing_time_ms=processing_time_ms,
-                user_agent=user_agent,
-                metadata=metadata,
-            )
+                # Store the request ID on the request state for later reference
+                # This allows updates for streaming requests
+                request_id = str(uuid.uuid4())
+                if hasattr(request, "state"):
+                    request.state.tracked_request_id = request_id
+
+                return True
+            except asyncio.TimeoutError:
+                # If queue is full, log but don't block the request
+                logger.warning("Usage tracking queue is full, event dropped")
+                return False
 
         except Exception as e:
-            logger.error(f"Failed to track usage event: {e}")
+            logger.error(f"Error queueing usage event: {e}")
             return False
+
+    # Add a method to check the health of the tracking service
+    async def check_health(self) -> Dict[str, Any]:
+        """Check the health of the usage tracking service.
+
+        Returns:
+            Dict with health status information
+        """
+        health_data = {
+            "enabled": settings.enable_usage_tracking,
+            "tracking_client_available": self._supabase is not None,
+            "error_count": self._tracking_error_count,
+            "healthy": self._tracking_error_count == 0,
+        }
+
+        # Check database connection if client available
+        if self._supabase and hasattr(self._supabase, "check_health"):
+            health_data["database_connection"] = await self._supabase.check_health()
+
+        return health_data
+
+    async def get_voice_usage_statistics(self, user_id: str) -> Optional[Dict]:
+        """Get voice usage statistics for a specific user.
+
+        Args:
+            user_id: User ID to get statistics for
+
+        Returns:
+            Dictionary containing voice usage statistics or None if error
+        """
+        if not self._supabase:
+            logger.warning("Supabase client not initialized")
+            return None
+
+        try:
+            # Calculate the time range for the current month
+            now = datetime.utcnow()
+            period_start = datetime(now.year, now.month, 1)
+            if now.month < 12:
+                period_end = datetime(now.year, now.month + 1, 1) - timedelta(seconds=1)
+            else:
+                period_end = datetime(now.year + 1, 1, 1) - timedelta(seconds=1)
+
+            # Convert to ISO format for the database query
+            period_start_iso = period_start.isoformat()
+            period_end_iso = period_end.isoformat()
+
+            # Execute an RPC call to the database function (more efficient)
+            # This function aggregates voice usage from the time-series data
+            result = await self._supabase.rpc(
+                "get_voice_usage_statistics",
+                {
+                    "p_user_id": user_id,
+                    "p_period_start": period_start_iso,
+                    "p_period_end": period_end_iso,
+                },
+            ).execute()
+
+            if result.data:
+                return result.data
+
+            # Fallback to direct query if RPC fails
+            # Query the usage_events table to get voice usage statistics
+            query = (
+                self._supabase.table("usage_events")
+                .select(
+                    "voice_id",
+                    "count(*) as request_count",
+                    "sum(character_count) as total_characters",
+                    "sum(audio_duration_ms) as total_audio_ms",
+                    "avg(processing_time_ms) as avg_processing_time_ms",
+                )
+                .eq("user_id", user_id)
+                .gte("timestamp", period_start_iso)
+                .lte("timestamp", period_end_iso)
+                .not_is("voice_id", "null")
+                .group_by("voice_id")
+                .order("total_characters", desc=True)
+            )
+
+            result = await query.execute()
+
+            if not result.data:
+                return {}
+
+            # Format the result as a dictionary with voice_id as the key
+            voice_stats = {}
+            for item in result.data:
+                voice_id = item.pop("voice_id")
+                voice_stats[voice_id] = item
+
+            return voice_stats
+
+        except Exception as e:
+            logger.error(f"Error getting voice usage statistics: {e}")
+            return None
+
+    async def get_performance_statistics(self, user_id: str) -> Optional[Dict]:
+        """Get API performance statistics for a specific user.
+
+        Args:
+            user_id: User ID to get statistics for
+
+        Returns:
+            Dictionary containing performance statistics or None if error
+        """
+        if not self._supabase:
+            logger.warning("Supabase client not initialized")
+            return None
+
+        try:
+            # Calculate the time range for the current month
+            now = datetime.utcnow()
+            period_start = datetime(now.year, now.month, 1)
+            if now.month < 12:
+                period_end = datetime(now.year, now.month + 1, 1) - timedelta(seconds=1)
+            else:
+                period_end = datetime(now.year + 1, 1, 1) - timedelta(seconds=1)
+
+            # Convert to ISO format for the database query
+            period_start_iso = period_start.isoformat()
+            period_end_iso = period_end.isoformat()
+
+            # Execute an RPC call to the database function (more efficient)
+            result = await self._supabase.rpc(
+                "get_performance_statistics",
+                {
+                    "p_user_id": user_id,
+                    "p_period_start": period_start_iso,
+                    "p_period_end": period_end_iso,
+                },
+            ).execute()
+
+            if result.data:
+                return result.data
+
+            # Fallback to direct query if RPC fails
+            # Query the usage_events table to get performance statistics
+            query = (
+                self._supabase.table("usage_events")
+                .select(
+                    "endpoint",
+                    "count(*) as request_count",
+                    "avg(processing_time_ms) as avg_processing_time_ms",
+                    "min(processing_time_ms) as min_processing_time_ms",
+                    "max(processing_time_ms) as max_processing_time_ms",
+                    "count(case when status_code >= 200 and status_code < 300 then 1 end) as successful_requests",
+                    "count(case when status_code >= 400 then 1 end) as error_requests",
+                )
+                .eq("user_id", user_id)
+                .gte("timestamp", period_start_iso)
+                .lte("timestamp", period_end_iso)
+                .group_by("endpoint")
+                .order("request_count", desc=True)
+            )
+
+            result = await query.execute()
+
+            if not result.data:
+                return {
+                    "endpoints": {},
+                    "summary": {
+                        "total_requests": 0,
+                        "avg_processing_time_ms": 0,
+                        "success_rate": 100,  # Default to 100% if no data
+                    },
+                }
+
+            # Format the result as a nested dictionary
+            endpoints = {}
+            total_requests = 0
+            total_successful = 0
+            total_processing_time = 0
+
+            for item in result.data:
+                endpoint = item.pop("endpoint")
+                endpoints[endpoint] = item
+                total_requests += item["request_count"]
+                total_successful += item["successful_requests"]
+                total_processing_time += (
+                    item["avg_processing_time_ms"] * item["request_count"]
+                )
+
+            # Calculate summary statistics
+            avg_processing_time = 0
+            if total_requests > 0:
+                avg_processing_time = total_processing_time / total_requests
+
+            success_rate = 100
+            if total_requests > 0:
+                success_rate = (total_successful / total_requests) * 100
+
+            return {
+                "endpoints": endpoints,
+                "summary": {
+                    "total_requests": total_requests,
+                    "avg_processing_time_ms": round(avg_processing_time, 2),
+                    "success_rate": round(success_rate, 2),
+                },
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting performance statistics: {e}")
+            return None

@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     api_version: str = "1.0.0"
     host: str = "0.0.0.0"
     port: int = 8880
+    debug: bool = True  # Enable debug mode for additional logging and headers
 
     # Supabase Settings
     supabase_url: str | None = None

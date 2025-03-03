@@ -1,24 +1,63 @@
 """OpenAI-compatible router for text-to-speech"""
 
+import asyncio
 import io
 import json
 import os
-import re
 import tempfile
-from typing import AsyncGenerator, Dict, List, Union
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
+from typing import Dict, List, Optional, Union
 
 import aiofiles
 import torch
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from loguru import logger
+
+from api.src.core.timing import TimingTracker
 
 from ..core.config import settings
 from ..services.audio import AudioService
 from ..services.tts_service import TTSService
-from ..services.usage_tracking.usage_service import UsageTrackingService, parse_iso_datetime
+from ..services.usage_tracking.usage_service import (
+    UsageTrackingService,
+)
 from ..structures import OpenAISpeechRequest
+
+
+def estimate_audio_duration(audio_size_bytes: int, format: str) -> int:
+    """Estimate audio duration in milliseconds based on file size and format.
+
+    Args:
+        audio_size_bytes: Size of the audio file in bytes
+        format: Audio format (mp3, opus, aac, flac, wav, pcm)
+
+    Returns:
+        Estimated duration in milliseconds
+    """
+    # Bitrates for different formats in bits per second
+    # These are rough estimates and will vary based on quality settings
+    bitrates = {
+        "mp3": 128000,  # 128 kbps (typical MP3)
+        "opus": 64000,  # 64 kbps (good quality Opus)
+        "aac": 128000,  # 128 kbps (typical AAC)
+        "flac": 700000,  # ~700 kbps (typical FLAC)
+        "wav": 768000,  # 16-bit stereo at 24kHz
+        "pcm": 384000,  # 16-bit mono at 24kHz
+    }
+
+    # Use the appropriate bitrate or default to mp3
+    bitrate = bitrates.get(format.lower(), 128000)
+
+    # Convert bytes to bits
+    audio_size_bits = audio_size_bytes * 8
+
+    # Calculate duration: size/bitrate = seconds
+    duration_seconds = audio_size_bits / bitrate
+
+    # Convert to milliseconds
+    return int(duration_seconds * 1000)
 
 
 # Load OpenAI mappings
@@ -150,342 +189,591 @@ async def process_voices(
 
 
 async def stream_audio_chunks(
-    tts_service: TTSService, request: OpenAISpeechRequest, client_request: Request
-) -> AsyncGenerator[bytes, None]:
-    """Stream audio chunks as they're generated with client disconnect handling"""
-    voice_name = await process_voices(request.voice, tts_service)
+    response: StreamingResponse,
+    character_count: int,
+    word_count: Optional[int] = None,
+    request: Request = None,
+    voice_id: Optional[str] = None,
+    tracking_service: Optional[UsageTrackingService] = None,
+) -> StreamingResponse:
+    """Wrap a streaming response to track usage metrics."""
+    # Get the original iterator
+    original_iterator = response.body_iterator
 
-    try:
-        logger.info(f"Starting audio generation with lang_code: {request.lang_code}")
-        async for chunk in tts_service.generate_audio_stream(
-            text=request.input,
-            voice=voice_name,
-            speed=request.speed,
-            output_format=request.response_format,
-            lang_code=request.lang_code
-            or settings.default_voice_code
-            or voice_name[0].lower(),
-            normalization_options=request.normalization_options,
-        ):
-            # Check if client is still connected
-            is_disconnected = client_request.is_disconnected
-            if callable(is_disconnected):
-                is_disconnected = await is_disconnected()
-            if is_disconnected:
-                logger.info("Client disconnected, stopping audio generation")
-                break
-            yield chunk
-    except Exception as e:
-        logger.error(f"Error in audio streaming: {str(e)}")
-        # Let the exception propagate to trigger cleanup
-        raise
+    # Get current time for metrics
+    start_time = time.time()
+    stream_wrapper_start_time = time.time()
+
+    # Get timing tracker from request state
+    timing_tracker = getattr(request.state, "timing_tracker", None) if request else None
+    if timing_tracker:
+        timing_tracker.mark("stream_wrapper_start")
+
+    # Get the request start time from request state if available
+    request_start_time = getattr(request.state, "request_start_time", None) if request else None
+
+    # Prepare usage tracking data
+    if tracking_service and request:
+        try:
+            # Calculate audio duration estimate based on character count
+            audio_duration_estimate = None
+            if character_count > 0:
+                # Estimate audio duration based on character count and format
+                # For very short text, streaming overhead is significant
+                format_name = request.query_params.get("response_format", "mp3")
+                audio_duration_estimate = estimate_audio_duration(
+                    character_count, format_name
+                )
+        except Exception as e:
+            # Don't let estimation errors block streaming
+            logger.warning(f"Error estimating audio duration: {e}")
+
+    # Start timing for pre-streaming setup
+    if timing_tracker:
+        timing_tracker.start_event("pre_streaming_setup")
+
+    # Skip pre-stream tracking to reduce latency - we'll track after the first chunk
+    pre_tracking_start = time.time()
+    initial_tracking_done = False
+
+    pre_streaming_duration = time.time() - pre_tracking_start
+    if timing_tracker:
+        timing_tracker.end_event("pre_streaming_setup")
+        logger.debug(
+            f"⏱️ Pre-streaming setup time: {timing_tracker.durations.get('pre_streaming_setup', 0):.4f}s"
+        )
+
+    # Record total wrapper setup time before the iterator
+    wrapper_setup_time = time.time() - stream_wrapper_start_time
+    logger.debug(f"⏱️ Stream wrapper setup time: {wrapper_setup_time:.4f}s")
+
+    # Get timing tracker from request state
+    if timing_tracker:
+        timing_tracker.start_event("time_to_first_chunk_delivery")
+        logger.debug(f"⏱️ Starting time to first chunk measurement")
+
+    # Wrap the original iterator to track actual metrics
+    async def tracked_iterator():
+        nonlocal start_time, initial_tracking_done
+        iterator_start_time = time.time()
+
+        total_bytes = 0
+        total_chunks = 0
+        last_chunk = None
+        first_chunk_sent = False
+        first_chunk_timing = {}
+        
+        # Keep a reference to the original_iterator to ensure it's not garbage collected
+        _original_iterator = original_iterator
+
+        try:
+            # Stream all audio chunks
+            logger.debug(
+                f"⏱️ Starting audio chunk iteration at {time.time() - start_time:.4f}s"
+            )
+            iterator_begin = time.time()
+
+            # Wrap iterator to track timing for entering/exiting the first yield
+            async for chunk in _original_iterator:
+                chunk_received_time = time.time()
+                
+                # Skip empty chunks
+                if chunk is None or len(chunk) == 0:
+                    logger.warning("Received empty chunk from original iterator, skipping")
+                    continue
+
+                # Mark the first chunk delivery time
+                if not first_chunk_sent:
+                    first_chunk_received = chunk_received_time - iterator_begin
+                    if timing_tracker:
+                        ttfc = timing_tracker.end_event("time_to_first_chunk_delivery")
+                        first_chunk_timing["time_to_first_chunk_delivery"] = ttfc
+                        logger.debug(f"⏱️ Time to first chunk (delivery): {ttfc:.4f}s")
+                        logger.debug(
+                            f"⏱️ Time from iterator start to first chunk: {first_chunk_received:.4f}s"
+                        )
+
+                        # Calculate and log the full trace time from request to first chunk
+                        request_start = getattr(
+                            request.state, "request_start_time", None
+                        )
+                        if request_start:
+                            full_trace = chunk_received_time - request_start
+                            logger.debug(
+                                f"⏱️ Full trace from request to first chunk: {full_trace:.4f}s"
+                            )
+                            first_chunk_timing["full_trace_time"] = full_trace
+
+                    first_chunk_sent = True
+
+                    # After the first chunk is sent, track the usage in the background
+                    # This moves the database operation out of the critical path
+                    if tracking_service and request and not initial_tracking_done:
+                        initial_tracking_done = True
+                        # Create a task but don't await it
+                        asyncio.create_task(
+                            tracking_service.track_usage_event(
+                                request=request,
+                                endpoint=request.url.path,
+                                http_method=request.method,
+                                status_code=200,
+                                character_count=character_count,
+                                word_count=word_count,
+                                voice_id=voice_id,
+                                audio_duration_ms=audio_duration_estimate,
+                                processing_time_ms=int(
+                                    (time.time() - start_time) * 1000
+                                ),
+                                metadata={
+                                    "streaming": True,
+                                    "is_estimate": True,
+                                    "ttfc_details": first_chunk_timing,
+                                },
+                            )
+                        )
+
+                # Update total bytes and chunks metrics
+                chunk_size = len(chunk)
+                total_bytes += chunk_size
+                total_chunks += 1
+                last_chunk = chunk
+
+                # Record chunk size for first chunk
+                if total_chunks == 1:
+                    logger.debug(f"⏱️ First chunk size: {chunk_size} bytes")
+
+                # Measure yield timing
+                before_yield = time.time()
+                yield chunk  # This is the critical line that sends audio data to the client
+                after_yield = time.time()
+                yield_time = after_yield - before_yield
+
+                # Log yield time only for first chunk to avoid log spam
+                if total_chunks == 1:
+                    logger.debug(f"⏱️ First chunk yield time: {yield_time:.4f}s")
+
+                # For debugging, log first few chunks
+                if total_chunks <= 5:
+                    logger.debug(
+                        f"Yielded chunk {total_chunks}: {chunk_size} bytes after {time.time() - start_time:.4f}s"
+                    )
+
+            # All chunks processed
+            processing_time = time.time() - start_time
+            logger.info(
+                f"Audio streaming completed: {total_chunks} chunks, {total_bytes} bytes in {processing_time:.4f}s"
+            )
+
+            # Final tracking with actual metrics after streaming completes
+            if tracking_service and request:
+                # Now we have exact size and can better estimate duration
+                audio_format = request.query_params.get("response_format", "pcm")
+                audio_duration = estimate_audio_duration(total_bytes, audio_format)
+                logger.debug(
+                    f"Audio duration estimate from bytes: {audio_duration}ms ({audio_format})"
+                )
+                # Track final statistics in background
+                try:
+                    await tracking_service.track_usage_event(
+                        request=request,
+                        endpoint=request.url.path,
+                        http_method=request.method,
+                        status_code=200,
+                        character_count=character_count,
+                        word_count=word_count,
+                        voice_id=voice_id,
+                        audio_duration_ms=audio_duration,
+                        processing_time_ms=int(processing_time * 1000),
+                        metadata={
+                            "streaming": True,
+                            "total_bytes": total_bytes,
+                            "chunk_count": total_chunks,
+                        },
+                    )
+                except Exception as tracking_e:
+                    logger.error(f"Error during final usage tracking: {tracking_e}")
+
+        except Exception as e:
+            # Log any errors that occur during streaming
+            logger.error(f"Error during audio streaming: {e}")
+            # Track error in background if available
+            if tracking_service and request:
+                try:
+                    await tracking_service.track_usage_event(
+                        request=request,
+                        endpoint=request.url.path,
+                        http_method=request.method,
+                        status_code=500,  # Internal error
+                        character_count=character_count,
+                        word_count=word_count,
+                        voice_id=voice_id,
+                        processing_time_ms=int((time.time() - start_time) * 1000),
+                        metadata={"streaming": True, "error": str(e)},
+                    )
+                except Exception as tracking_e:
+                    logger.error(f"Error during error tracking: {tracking_e}")
+            raise
+
+    # Replace the original iterator with our tracked version
+    response.body_iterator = tracked_iterator()
+
+    # Add TTFC debug headers if requested
+    if request and request.headers.get("X-Debug") == "true":
+        timing_data = {}
+        if timing_tracker and timing_tracker.durations:
+            timing_data = {k: v for k, v in timing_tracker.durations.items()}
+        response.headers["X-TTFC-Debug"] = json.dumps(
+            {"time_to_first_chunk_delivery": 0}
+        )  # Will be updated by iterator
+
+    # Calculate response start time - safely handle timing info
+    middleware_duration = getattr(request.state, "middleware_duration", 0) if request else 0
+    time_to_response_start = 0
+    if request_start_time:
+        time_to_response_start = time.time() - request_start_time
+
+    # Add timing headers for client debugging
+    response.headers["X-Timing-Debug"] = json.dumps(
+        {
+            "pre_stream_tracking_call": pre_streaming_duration,
+            "wrapper_setup_time": wrapper_setup_time,
+            "middleware_duration_before_handler": middleware_duration,
+            "time_to_response_start": time_to_response_start,
+        }
+    )
+
+    return response
+
+
+def get_audio_bitrate(format_name: str) -> Optional[int]:
+    """
+    Get the estimated bitrate for an audio format in bits per second.
+
+    Args:
+        format_name: Audio format name (mp3, opus, aac, etc.)
+
+    Returns:
+        int: Bitrate in bits per second or None if unknown format
+    """
+    format_name = format_name.lower()
+
+    # Common formats and their typical bitrates
+    bitrates = {
+        "mp3": 128000,  # 128 kbps
+        "opus": 64000,  # 64 kbps
+        "aac": 128000,  # 128 kbps
+        "flac": 700000,  # ~700 kbps (variable)
+        "wav": 768000,  # 16-bit stereo at 24kHz
+        "pcm": 384000,  # 16-bit mono at 24kHz
+    }
+
+    return bitrates.get(format_name)
 
 
 @router.post("/audio/speech")
 async def create_speech(
     request: OpenAISpeechRequest,
     client_request: Request,
-    x_raw_response: str = Header(None, alias="x-raw-response"),
-):
-    """OpenAI-compatible endpoint for text-to-speech"""
-    # Validate model before processing request
-    if request.model not in _openai_mappings["models"]:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "invalid_model",
-                "message": f"Unsupported model: {request.model}",
-                "type": "invalid_request_error",
-            },
+    tts_service: TTSService = Depends(get_tts_service),
+) -> Response:
+    """Generate speech from text using OpenAI compatible API."""
+    handler_start_time = time.time()
+    try:
+        # Create timing tracker
+        timing_tracker = TimingTracker()
+        client_request.state.timing_tracker = timing_tracker
+        timing_tracker.mark("handler_start")
+
+        # Log that we started processing the request
+        logger.info(
+            f"Processing speech request for text: '{request.input[:30]}...' with voice: {request.voice}"
         )
 
-    try:
-        # model_name = get_model_name(request.model)
-        tts_service = await get_tts_service()
-        voice_name = await process_voices(request.voice, tts_service)
+        # Extract request data
+        input_text = request.input
+        voice_id = request.voice
+        speed = request.speed
+        response_format = request.response_format
+        normalization_options = getattr(request, "normalization_options", None)
 
-        # Check usage limits if tracking is enabled
-        if settings.enable_usage_tracking:
-            usage_service = await get_usage_service()
-            
-            # Get request type from request state (set by middleware)
-            request_type = getattr(client_request.state, "request_type", None)
-            
-            # If request type is not set, determine it based on headers
-            if not request_type:
-                api_key = client_request.headers.get("X-API-Key")
-                user_id = client_request.headers.get("X-User-ID")
-                
-                if api_key:
-                    request_type = "paid"
-                elif user_id:
-                    request_type = "free"
-                else:
-                    request_type = "demo"
-            
-            # Validate based on request type
-            if request_type == "paid":
-                # Paid tier validation
-                api_key_prefix = getattr(client_request.state, "api_key_prefix", None)
-                if not api_key_prefix:
-                    api_key = client_request.headers.get("X-API-Key", "")
-                    api_key_prefix = api_key[:8] if api_key else None
-                
-                if not api_key_prefix:
-                    raise HTTPException(
-                        status_code=401,
-                        detail={
-                            "error": "missing_api_key",
-                            "message": "API key is required",
-                            "type": "authentication_error",
+        # Early validation
+        timing_tracker.start_event("input_validation")
+        validate_input_length(input_text)
+        timing_tracker.end_event("input_validation")
+        logger.debug(
+            f"⏱️ Input validation: {timing_tracker.durations.get('input_validation', 0):.4f}s"
+        )
+
+        # Get validation timing information for debugging
+        timing_header = client_request.headers.get("X-Timing-Breakdown", "")
+
+        # Check if we're in emergency mode
+        is_emergency_mode = getattr(client_request.state, "is_emergency_mode", False)
+        if is_emergency_mode:
+            timing_tracker.mark("emergency_mode_enabled")
+            logger.warning(
+                "Processing speech request in emergency mode due to database unavailability"
+            )
+
+        # Set up usage tracking if enabled
+        timing_tracker.start_event("usage_tracking_setup")
+        usage_tracking = None
+        if settings.enable_usage_tracking and not is_emergency_mode:
+            try:
+                usage_tracking = await UsageTrackingService.create()
+            except Exception as e:
+                logger.error(f"Failed to initialize usage tracking: {e}")
+                # Don't let tracking errors prevent the main functionality
+        timing_tracker.end_event("usage_tracking_setup")
+        logger.debug(
+            f"⏱️ Usage tracking setup: {timing_tracker.durations.get('usage_tracking_setup', 0):.4f}s"
+        )
+
+        # Detect if streaming is requested from the request body parameter
+        streaming_requested = request.stream
+
+        try:
+            # For streaming responses (e.g. for web players)
+            if streaming_requested:
+                streaming_start = time.time()
+                logger.info(
+                    f"Streaming speech response for format: {response_format} (stream parameter: {streaming_requested})"
+                )
+
+                # Log handler pre-processing time before we start TTS
+                handler_preprocesssing_time = time.time() - handler_start_time
+                logger.debug(
+                    f"⏱️ Handler pre-processing time: {handler_preprocesssing_time:.4f}s"
+                )
+
+                # Set up speech generator
+                timing_tracker.start_event("tts_service_setup")
+                speech_generator = tts_service.generate_audio_stream(
+                    text=input_text,
+                    voice=voice_id,
+                    speed=speed,
+                    output_format=response_format,
+                    lang_code=request.lang if hasattr(request, "lang") else None,
+                    normalization_options=normalization_options,
+                    request=client_request,  # Pass the request to enable timing tracking
+                )
+                tts_setup_time = timing_tracker.end_event("tts_service_setup")
+                logger.debug(f"⏱️ TTS service setup time: {tts_setup_time:.4f}s")
+
+                # Validate that we actually have a generator
+                if speech_generator is None:
+                    logger.error("TTS service returned None for speech generator")
+                    raise HTTPException(status_code=500, detail="Failed to create audio stream")
+
+                # Log intermediate timing results (before streaming)
+                logger.info("Intermediate timing results (before streaming):")
+                timing_tracker.log_breakdown(log_level="DEBUG")
+
+                # Get the appropriate content type
+                timing_tracker.start_event("response_preparation")
+                content_type = get_content_type(response_format)
+
+                # Check if the speech generator will produce valid audio
+                try:
+                    # Create a wrapper for the speech generator to handle potential empty chunks
+                    async def filtered_generator():
+                        empty_chunk_count = 0
+                        async for chunk in speech_generator:
+                            if chunk is None or len(chunk) == 0:
+                                empty_chunk_count += 1
+                                if empty_chunk_count <= 5:  # Log only the first few to avoid spam
+                                    logger.warning(f"Empty chunk received from TTS service (count: {empty_chunk_count})")
+                                continue
+                            yield chunk
+                        
+                        if empty_chunk_count > 0:
+                            logger.warning(f"Total empty chunks filtered out: {empty_chunk_count}")
+
+                    # Create streaming response with the filtered generator
+                    streaming_response = StreamingResponse(
+                        filtered_generator(),
+                        media_type=content_type,
+                        headers={
+                            "Content-Type": content_type,
                         },
                     )
-                
-                is_valid, error_msg, context = await usage_service.validate_request(
-                    api_key_prefix, len(request.input)
+                except Exception as e:
+                    logger.error(f"Error preparing streaming response: {e}")
+                    raise HTTPException(status_code=500, detail="Error preparing audio stream")
+
+                # Wrap the streaming response with tracking
+                character_count = len(input_text)
+                word_count = calculate_word_count(input_text)
+
+                response_prep_time = timing_tracker.end_event("response_preparation")
+                logger.debug(f"⏱️ Response preparation time: {response_prep_time:.4f}s")
+
+                # Measure time to prepare the entire response before streaming
+                stream_total_prep_time = time.time() - streaming_start
+                logger.debug(
+                    f"⏱️ Total time to prepare streaming response: {stream_total_prep_time:.4f}s"
                 )
-            elif request_type == "free":
-                # Free tier validation
-                user_id = getattr(client_request.state, "user", {}).get("id")
-                if not user_id:
-                    user_id = client_request.headers.get("X-User-ID")
-                
-                if not user_id:
-                    raise HTTPException(
-                        status_code=401,
-                        detail={
-                            "error": "missing_user_id",
-                            "message": "User ID is required for free tier",
-                            "type": "authentication_error",
-                        },
-                    )
-                
-                is_valid, error_msg, context = await usage_service.validate_free_tier_request(
-                    user_id, len(request.input)
+                logger.debug(
+                    f"⏱️ Total handler time before streaming starts: {time.time() - handler_start_time:.4f}s"
                 )
+
+                # Add debug info to response headers
+                streaming_response.headers["X-Handler-Prep-Time"] = str(
+                    handler_preprocesssing_time
+                )
+                streaming_response.headers["X-TTS-Setup-Time"] = str(tts_setup_time)
+                streaming_response.headers["X-Response-Prep-Time"] = str(
+                    response_prep_time
+                )
+                streaming_response.headers["X-Stream-Total-Prep-Time"] = str(
+                    stream_total_prep_time
+                )
+
+                # Now pass the streaming response to our tracker
+                return await stream_audio_chunks(
+                    response=streaming_response,
+                    character_count=character_count,
+                    word_count=word_count,
+                    request=client_request,
+                    voice_id=voice_id,
+                    tracking_service=usage_tracking,
+                )
+
+            # For non-streaming responses (regular downloads)
             else:
-                # Demo request validation (IP-based)
-                client_ip = getattr(client_request.state, "ip_address", None)
-                if not client_ip:
-                    client_ip = client_request.client.host
-                
-                is_valid, error_msg = await usage_service.validate_demo_request(
-                    client_ip, len(request.input)
-                )
-                context = None
-            
-            if not is_valid:
-                raise HTTPException(
-                    status_code=403,
-                    detail={
-                        "error": "usage_limit_exceeded",
-                        "message": error_msg or "Usage limit exceeded",
-                        "type": "usage_error",
-                    },
+                logger.info(
+                    f"Processing non-streaming speech request for format: {response_format}"
                 )
 
-        # Set content type based on format
-        content_type = {
-            "mp3": "audio/mpeg",
-            "opus": "audio/opus",
-            "aac": "audio/aac",
-            "flac": "audio/flac",
-            "wav": "audio/wav",
-            "pcm": "audio/pcm",
-        }.get(request.response_format, f"audio/{request.response_format}")
+                # Generate audio
+                timing_tracker.start_event("generate_audio")
+                audio_result, duration = await tts_service.generate_audio(
+                    text=input_text,
+                    voice=voice_id,
+                    speed=speed,
+                )
+                timing_tracker.end_event("generate_audio")
+                logger.info(f"Audio generation completed in {duration:.4f}s")
 
-        # Check if streaming is requested (default for OpenAI client)
-        if request.stream:
-            # Create generator but don't start it yet
-            generator = stream_audio_chunks(tts_service, request, client_request)
+                # Convert the numpy array to the requested format
+                timing_tracker.start_event("convert_audio")
+                audio_data = await AudioService.convert_audio(
+                    audio_result,
+                    24000,  # Sample rate is fixed at 24kHz
+                    response_format,
+                    speed,
+                    input_text,
+                )
+                timing_tracker.end_event("convert_audio")
 
-            # If download link requested, wrap generator with temp file writer
-            if request.return_download_link:
-                from ..services.temp_manager import TempFileWriter
+                # Log timing results at debug level (only once)
+                logger.info("Timing results after audio generation:")
+                timing_tracker.log_breakdown(log_level="DEBUG")
 
-                # Use download_format if specified, otherwise use response_format
-                output_format = request.download_format or request.response_format
-                temp_writer = TempFileWriter(output_format)
-                await temp_writer.__aenter__()  # Initialize temp file
+                # Calculate character count for usage tracking
+                character_count = len(input_text)
+                word_count = calculate_word_count(input_text)
 
-                # Get download path immediately after temp file creation
-                download_path = temp_writer.download_path
+                # Set state variables for tracking in middleware
+                client_request.state.audio_duration_ms = int(
+                    len(audio_result) / 24
+                )  # Convert samples to ms
+                client_request.state.word_count = word_count
 
-                # Create response headers with download path
+                # Track usage asynchronously if enabled
+                if usage_tracking and not is_emergency_mode:
+                    try:
+                        # No need to await this, can run in background
+                        asyncio.create_task(
+                            usage_tracking.track_usage_event(
+                                request=client_request,
+                                endpoint="/v1/audio/speech",
+                                http_method="POST",
+                                status_code=200,
+                                character_count=character_count,
+                                processing_time_ms=int(
+                                    timing_tracker.to_dict().get("total_request", 0)
+                                    * 1000
+                                ),
+                                voice_id=voice_id,
+                                audio_duration_ms=int(len(audio_result) / 24),
+                                word_count=word_count,
+                            )
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to track usage: {e}")
+
+                # Create response with appropriate headers
+                filename = f"speech_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.{response_format}"
+                audio_size = len(audio_data)
+
+                # Get the appropriate content type
+                content_type = get_content_type(response_format)
+
+                # Add OpenAI compatible response headers
                 headers = {
-                    "Content-Disposition": f"attachment; filename=speech.{output_format}",
-                    "X-Accel-Buffering": "no",
-                    "Cache-Control": "no-cache",
-                    "Transfer-Encoding": "chunked",
-                    "X-Download-Path": download_path,
+                    "Content-Type": content_type,
+                    "Content-Length": str(audio_size),
+                    "Content-Disposition": f"attachment; filename={filename}",
+                    "X-Character-Count": str(character_count),
+                    "X-Word-Count": str(word_count),
                 }
 
-                # Create async generator for streaming
-                async def dual_output():
-                    try:
-                        # Write chunks to temp file and stream
-                        async for chunk in generator:
-                            if chunk:  # Skip empty chunks
-                                await temp_writer.write(chunk)
-                                yield chunk
+                # We already logged the timing information above, no need to log again
 
-                        # Finalize the temp file
-                        await temp_writer.finalize()
-                    except Exception as e:
-                        logger.error(f"Error in dual output streaming: {e}")
-                        await temp_writer.__aexit__(type(e), e, e.__traceback__)
-                        raise
-                    finally:
-                        # Ensure temp writer is closed
-                        if not temp_writer._finalized:
-                            await temp_writer.__aexit__(None, None, None)
+                # Estimate audio duration
+                if audio_size > 0:
+                    estimated_duration = estimate_audio_duration(
+                        audio_size, response_format
+                    )
+                    if estimated_duration:
+                        headers["X-Audio-Duration"] = str(estimated_duration)
 
-                # Stream with temp file writing
-                response = StreamingResponse(
-                    dual_output(), media_type=content_type, headers=headers
+                # Log final stats
+                logger.info(
+                    f"Completed speech generation: {character_count} chars, {word_count} words, {audio_size} bytes"
                 )
-            else:
-                # Standard streaming without download link
-                response = StreamingResponse(
-                    generator,
-                    media_type=content_type,
-                    headers={
-                        "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
-                        "X-Accel-Buffering": "no",
-                        "Cache-Control": "no-cache",
-                        "Transfer-Encoding": "chunked",
-                    },
-                )
-        else:
-            # Generate complete audio using public interface
-            audio, _ = await tts_service.generate_audio(
-                text=request.input,
-                voice=voice_name,
-                speed=request.speed,
-                lang_code=request.lang_code,
-            )
 
-            # Convert to requested format with proper finalization
-            content = await AudioService.convert_audio(
-                audio,
-                24000,
-                request.response_format,
-                is_first_chunk=True,
-                is_last_chunk=True,
-            )
+                return Response(content=audio_data, headers=headers)
 
-            response = Response(
-                content=content,
-                media_type=content_type,
-                headers={
-                    "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
-                    "Cache-Control": "no-cache",  # Prevent caching
+        except ValueError as e:
+            logger.warning(f"Validation error in speech generation: {str(e)}")
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "validation_error",
+                    "message": str(e),
+                    "type": "invalid_request_error",
                 },
             )
 
-        # Track usage after successful generation
-        if settings.enable_usage_tracking:
-            try:
-                # Get request type from request state
-                request_type = getattr(client_request.state, "request_type", None)
-                
-                # If request type is not set, determine it based on headers
-                if not request_type:
-                    api_key = client_request.headers.get("X-API-Key")
-                    user_id = client_request.headers.get("X-User-ID")
-                    
-                    if api_key:
-                        request_type = "paid"
-                    elif user_id:
-                        request_type = "free"
-                    else:
-                        request_type = "demo"
-                
-                # Track usage based on request type
-                if request_type == "paid":
-                    # Paid tier tracking
-                    subscription = getattr(client_request.state, "subscription", None)
-                    if not subscription:
-                        # If subscription not in state, we can't track usage
-                        logger.warning("Cannot track paid usage: subscription not in request state")
-                    else:
-                        await usage_service.track_request(
-                            subscription_id=subscription["id"],
-                            period_start=parse_iso_datetime(subscription["current_period_start"]),
-                            period_end=parse_iso_datetime(subscription["current_period_end"]),
-                            character_count=len(request.input),
-                        )
-                elif request_type == "free":
-                    # Free tier tracking
-                    user_id = getattr(client_request.state, "user", {}).get("id")
-                    if not user_id:
-                        user_id = client_request.headers.get("X-User-ID")
-                    
-                    if not user_id:
-                        logger.warning("Cannot track free tier usage: user ID not available")
-                    else:
-                        now = datetime.utcnow()
-                        period_start = datetime(now.year, now.month, 1)
-                        if now.month < 12:
-                            period_end = datetime(now.year, now.month + 1, 1) - timedelta(seconds=1)
-                        else:
-                            period_end = datetime(now.year + 1, 1, 1) - timedelta(seconds=1)
-                        
-                        await usage_service.track_free_tier_usage(
-                            user_id=user_id,
-                            period_start=period_start,
-                            period_end=period_end,
-                            character_count=len(request.input),
-                        )
-                else:
-                    # Demo request tracking
-                    client_ip = getattr(client_request.state, "ip_address", None)
-                    if not client_ip:
-                        client_ip = client_request.client.host
-                    
-                    await usage_service.track_demo_request(
-                        ip_address=client_ip,
-                        character_count=len(request.input),
-                    )
-            except Exception as e:
-                # Log but don't fail the request if tracking fails
-                logger.error(f"Failed to track usage: {e}")
-
-        return response
-
-    except ValueError as e:
-        # Handle validation errors
-        logger.warning(f"Invalid request: {str(e)}")
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "validation_error",
-                "message": str(e),
-                "type": "invalid_request_error",
-            },
-        )
-    except RuntimeError as e:
-        # Handle runtime/processing errors
-        logger.error(f"Processing error: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "processing_error",
-                "message": str(e),
-                "type": "server_error",
-            },
-        )
     except Exception as e:
-        # Handle unexpected errors
-        logger.error(f"Unexpected error in speech generation: {str(e)}")
-        raise HTTPException(
+        logger.exception(f"Error generating speech: {e}")
+        return JSONResponse(
             status_code=500,
-            detail={
-                "error": "processing_error",
-                "message": str(e),
-                "type": "server_error",
+            content={
+                "error": {
+                    "message": "Failed to generate speech",
+                    "type": "server_error",
+                }
             },
         )
+
+
+def calculate_word_count(text: str) -> int:
+    """
+    Calculate the number of words in a string.
+
+    Args:
+        text: Input text
+
+    Returns:
+        int: Word count
+    """
+    if not text:
+        return 0
+    # Split by whitespace and count non-empty words
+    return len([word for word in text.split() if word])
 
 
 @router.get("/download/{filename}")
@@ -760,19 +1048,19 @@ async def get_usage_stats(
 
         # Get request type from request state (set by middleware)
         request_type = getattr(request.state, "request_type", None)
-        
+
         # If request type is not set, determine it based on headers
         if not request_type:
             api_key = request.headers.get("X-API-Key")
             user_id = request.headers.get("X-User-ID")
-            
+
             if api_key:
                 request_type = "paid"
             elif user_id:
                 request_type = "free"
             else:
                 request_type = "demo"
-        
+
         # Get usage statistics based on request type
         if request_type == "paid":
             # Paid tier statistics
@@ -781,7 +1069,7 @@ async def get_usage_stats(
                 # Try to get user info from API key
                 api_key = request.headers.get("X-API-Key", "")
                 api_key_prefix = api_key[:8] if api_key else None
-                
+
                 if not api_key_prefix:
                     raise HTTPException(
                         status_code=401,
@@ -791,9 +1079,11 @@ async def get_usage_stats(
                             "type": "authentication_error",
                         },
                     )
-                
+
                 # Validate API key to get user info
-                is_valid, _, request_info = await usage_service._validate_api_key(api_key)
+                is_valid, _, request_info = await usage_service._validate_api_key(
+                    api_key, skip_limit_check=True
+                )
                 if not is_valid or not request_info:
                     raise HTTPException(
                         status_code=403,
@@ -803,9 +1093,9 @@ async def get_usage_stats(
                             "type": "authentication_error",
                         },
                     )
-                
+
                 user_info = request_info["user"]
-            
+
             # Get user statistics
             user_id = user_info["id"]
             stats = await usage_service.get_user_statistics(user_id)
@@ -814,7 +1104,7 @@ async def get_usage_stats(
             user_id = getattr(request.state, "user", {}).get("id")
             if not user_id:
                 user_id = request.headers.get("X-User-ID")
-            
+
             if not user_id:
                 raise HTTPException(
                     status_code=401,
@@ -824,7 +1114,7 @@ async def get_usage_stats(
                         "type": "authentication_error",
                     },
                 )
-            
+
             # Get user statistics
             stats = await usage_service.get_user_statistics(user_id)
         else:
@@ -832,9 +1122,9 @@ async def get_usage_stats(
             client_ip = getattr(request.state, "ip_address", None)
             if not client_ip:
                 client_ip = request.client.host
-            
+
             stats = await usage_service.get_demo_usage_stats(client_ip)
-        
+
         if stats is None:
             raise HTTPException(
                 status_code=500,
@@ -844,7 +1134,7 @@ async def get_usage_stats(
                     "type": "server_error",
                 },
             )
-            
+
         return stats
 
     except HTTPException:
@@ -859,3 +1149,74 @@ async def get_usage_stats(
                 "type": "server_error",
             },
         )
+
+
+def get_content_type(format_name: str) -> str:
+    """
+    Get the content type for an audio format.
+
+    Args:
+        format_name: Audio format name (mp3, opus, aac, etc.)
+
+    Returns:
+        str: The content type for the format
+    """
+    format_name = format_name.lower()
+
+    content_types = {
+        "mp3": "audio/mpeg",
+        "opus": "audio/opus",
+        "aac": "audio/aac",
+        "flac": "audio/flac",
+        "wav": "audio/wav",
+        "pcm": "audio/pcm",
+    }
+
+    return content_types.get(format_name, f"audio/{format_name}")
+
+
+def validate_input_length(input_text: str) -> None:
+    """
+    Validate the input text length.
+
+    Args:
+        input_text: The input text to validate
+
+    Raises:
+        ValueError: If the input text is too long or empty
+    """
+    # Check for empty input
+    if not input_text or input_text.strip() == "":
+        raise ValueError("Input text cannot be empty")
+
+    # Check for maximum length (adjust limit as needed)
+    max_length = 4096  # Example limit
+    if len(input_text) > max_length:
+        raise ValueError(
+            f"Input text exceeds maximum length of {max_length} characters"
+        )
+
+    return None
+
+
+def estimate_audio_duration(size_bytes: int, format_name: str) -> Optional[int]:
+    """
+    Estimate audio duration based on file size and format.
+
+    Args:
+        size_bytes: Size of the audio file in bytes
+        format_name: Audio format (mp3, opus, aac, etc.)
+
+    Returns:
+        int: Estimated duration in milliseconds or None if unknown format
+    """
+    # Get bitrate for the format
+    bitrate = get_audio_bitrate(format_name.lower())
+
+    if not bitrate or not size_bytes:
+        return None
+
+    # Calculate duration: size_bytes * 8 (bits) / bitrate (bits/second) * 1000 (milliseconds)
+    duration_ms = int((size_bytes * 8 / bitrate) * 1000)
+
+    return duration_ms
