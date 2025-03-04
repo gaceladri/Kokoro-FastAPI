@@ -83,12 +83,13 @@ FROM public.ecr.aws/lambda/python:3.9
 WORKDIR /var/task
 COPY requirements.txt .
 
-# Install zip utility first, then install dependencies and package them
+# Install zip utility first, then install dependencies and package them with proper Lambda layer structure
 RUN yum install -y zip && \
+    mkdir -p /python && \
     pip install -r requirements.txt -t /python && \
     mkdir -p /output && \
-    cd /python && \
-    zip -r /output/dependencies.zip .
+    cd / && \
+    zip -r /output/dependencies.zip python
 
 # Provide a default command
 CMD ["echo", "Dependencies built and packaged successfully"]
@@ -115,7 +116,8 @@ fi
 
 # Upload the dependencies layer to S3
 echo "Uploading dependencies layer to S3..."
-$AWS_CMD s3 cp dependencies-layer.zip s3://$DEPLOYMENT_BUCKET/dependencies-layer.zip --region $REGION --profile $AWS_PROFILE
+LAYER_S3_KEY="dependencies-layer-$(date +%s).zip"
+$AWS_CMD s3 cp dependencies-layer.zip s3://$DEPLOYMENT_BUCKET/$LAYER_S3_KEY --region $REGION --profile $AWS_PROFILE
 
 # Prompt for sensitive parameters if not provided
 if [ -z "$STRIPE_API_KEY" ]; then
@@ -148,9 +150,27 @@ rm -rf $LAMBDA_CODE_DIR
 mkdir -p $LAMBDA_CODE_DIR
 cp handler.py $LAMBDA_CODE_DIR/
 
-# Create an updated template with the correct S3 URI for the layer
+# Add a timestamp file to force the Lambda package to be unique every deployment
+DEPLOY_TIMESTAMP=$(date +%s)
+echo "Deployment timestamp: $DEPLOY_TIMESTAMP" > $LAMBDA_CODE_DIR/deployment_timestamp.txt
+
+# Create an updated template with the correct S3 URIs
 echo "Creating updated template file..."
-sed "s|ContentUri: lambda_code/|ContentUri: s3://$DEPLOYMENT_BUCKET/dependencies-layer.zip|" template.yaml > template-updated.yaml
+# First create a copy of the original template
+cp template.yaml template-updated.yaml
+
+# Add a timestamp to ensure we're creating a new layer version
+TIMESTAMP=$(date +%s)
+
+# Replace the ContentUri for the dependencies layer only, not for the Lambda function
+sed -i "/DependenciesLayer:/,/CompatibleRuntimes:/ s|ContentUri: lambda_code/|ContentUri: s3://$DEPLOYMENT_BUCKET/$LAYER_S3_KEY|" template-updated.yaml
+
+# Also update the layer name to force a new version
+sed -i "s|LayerName: !Sub stripe-reporter-dependencies-\${Environment}|LayerName: !Sub stripe-reporter-dependencies-\${Environment}-$TIMESTAMP|" template-updated.yaml
+
+# Create a separate copy of the updated template for review
+echo "Updated template saved to updated-template.yaml for review"
+cp template-updated.yaml updated-template.yaml
 
 # Package the Lambda function
 echo "Packaging the Lambda function..."
@@ -159,7 +179,8 @@ sam package \
     --s3-bucket $DEPLOYMENT_BUCKET \
     --output-template-file $BUILD_DIR/$PACKAGE_FILE \
     --region $REGION \
-    --profile $AWS_PROFILE
+    --profile $AWS_PROFILE \
+    --force-upload
 
 # Deploy the Lambda function
 echo "Deploying the Lambda function..."
@@ -173,7 +194,8 @@ sam deploy \
         SupabaseServiceKeyParam=$SUPABASE_SERVICE_KEY \
     --capabilities CAPABILITY_IAM \
     --region $REGION \
-    --profile $AWS_PROFILE
+    --profile $AWS_PROFILE \
+    --no-fail-on-empty-changeset
 
 # Clean up (with error handling)
 echo "Cleaning up..."

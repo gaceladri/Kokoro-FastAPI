@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Stripe Usage Reporter Lambda function with scheduled trigger
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+  
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 2 * * ? *)
+    Description: Schedule expression for the Lambda function (default is daily at 2:00 AM UTC)
+    
+  StripeApiKeyParam:
+    Type: String
+    Description: The Stripe API key for usage reporting
+    NoEcho: true
+    
+  SupabaseUrlParam:
+    Type: String
+    Description: The Supabase URL for database access
+    NoEcho: true
+    
+  SupabaseServiceKeyParam:
+    Type: String
+    Description: The Supabase service key for database access
+    NoEcho: true
+
+Resources:
+  # Lambda Layer for Dependencies
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub stripe-reporter-dependencies-${Environment}-1741095758
+      Description: Dependencies for the Stripe Reporter Lambda function
+      ContentUri: s3://stripe-usage-reporter-deployment-prod/dependencies-layer-1741095754.zip 
+      CompatibleRuntimes:
+        - python3.9
+      RetentionPolicy: Retain
+
+  StripeReporterLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub stripe-usage-reporter-${Environment}
+      Handler: handler.lambda_handler
+      Runtime: python3.9
+      CodeUri: lambda_code/
+      Description: Reports character overages to Stripe for metered billing
+      MemorySize: 256
+      Timeout: 300
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          STRIPE_API_KEY: !Ref StripeApiKeyParam
+          SUPABASE_URL: !Ref SupabaseUrlParam
+          SUPABASE_SERVICE_KEY: !Ref SupabaseServiceKeyParam
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleExpression
+            Name: !Sub stripe-reporter-schedule-${Environment}
+            Description: Scheduled event to trigger the Stripe usage reporter
+            Enabled: true
+      Policies:
+        - CloudWatchLambdaInsightsExecutionRolePolicy
+        - AWSLambdaBasicExecutionRole
+
+  # CloudWatch Logs
+  StripeReporterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/stripe-usage-reporter-${Environment}
+      RetentionInDays: 30
+
+  # Dashboard for monitoring
+  StripeReporterDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub stripe-usage-reporter-dashboard-${Environment}
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "stripe-usage-reporter-${Environment}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Sum",
+                "title": "Lambda Function Metrics"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  StripeReporterLambdaFunction:
+    Description: Lambda function ARN
+    Value: !GetAtt StripeReporterLambdaFunction.Arn
+    
+  StripeReporterLambdaFunctionName:
+    Description: Lambda function name
+    Value: !Ref StripeReporterLambdaFunction
+    
+  StripeReporterSchedule:
+    Description: Schedule expression for the Lambda function
+    Value: !Ref ScheduleExpression
+    
+  StripeReporterDashboardUrl:
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${StripeReporterDashboard} 
