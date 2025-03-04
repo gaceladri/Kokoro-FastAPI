@@ -2,7 +2,6 @@ import asyncio
 import re
 import ssl
 import time
-import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -967,47 +966,88 @@ class UsageTrackingService:
         word_count: Optional[int] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Queue a usage event for background processing instead of blocking."""
+        """Track an API usage event.
+
+        Args:
+            request: Request object
+            endpoint: API endpoint
+            http_method: HTTP method
+            status_code: Response status code
+            character_count: Number of characters in the request
+            processing_time_ms: Processing time in milliseconds
+            voice_id: Voice ID used
+            audio_duration_ms: Audio duration in milliseconds
+            word_count: Number of words in the request
+            metadata: Additional metadata
+
+        Returns:
+            bool: True if successfully tracked, False otherwise
+        """
         if not self._should_track():
             return True
 
         try:
-            # Prepare the event data
+            # Create event data
             event_data = {
                 "request": request,
                 "endpoint": endpoint,
                 "http_method": http_method,
                 "status_code": status_code,
                 "character_count": character_count,
-                "processing_time_ms": processing_time_ms,
-                "voice_id": voice_id,
-                "audio_duration_ms": audio_duration_ms,
-                "word_count": word_count,
-                "metadata": metadata,
-                "timestamp": datetime.utcnow().isoformat(),
             }
 
-            # Don't block the main request - add to queue and return immediately
+            # Add optional fields
+            if processing_time_ms is not None:
+                event_data["processing_time_ms"] = processing_time_ms
+            if voice_id:
+                event_data["voice_id"] = voice_id
+            if audio_duration_ms is not None:
+                event_data["audio_duration_ms"] = audio_duration_ms
+            if word_count is not None:
+                event_data["word_count"] = word_count
+            if metadata:
+                event_data["metadata"] = metadata
+
+            # Prepare data for tracking
+            prepared_data = self._prepare_event_data(event_data)
+            if not prepared_data:
+                logger.warning("Invalid event data, skipping tracking")
+                return False
+
+            # Get the request type
+            request_type = prepared_data.get("request_type")
+
+            # For demo requests, also track in the free_usage table
+            if request_type == "demo" and "ip_address" in prepared_data:
+                ip_address = prepared_data["ip_address"]
+                # Track the demo request in free_usage table
+                await self.track_demo_request(ip_address, character_count)
+
+            # Add event to queue for async processing
             try:
-                # Try to add to queue with a short timeout
-                await asyncio.wait_for(
-                    self.__class__._event_queue.put(event_data), timeout=0.1
-                )
+                self._event_queue.put_nowait(prepared_data)
 
-                # Store the request ID on the request state for later reference
-                # This allows updates for streaming requests
-                request_id = str(uuid.uuid4())
-                if hasattr(request, "state"):
-                    request.state.tracked_request_id = request_id
+                # Start event processor if not already running
+                await self._start_event_processor()
 
+                # Flush queue periodically
+                now = time.time()
+                if now - self._last_batch_flush > 30:  # Flush every 30 seconds
+                    self._last_batch_flush = now
+
+                    # Process pending events in batch
+                    await self._process_event_queue(force=True)
+
+                self._record_tracking_success()
                 return True
-            except asyncio.TimeoutError:
-                # If queue is full, log but don't block the request
-                logger.warning("Usage tracking queue is full, event dropped")
+            except asyncio.QueueFull:
+                logger.warning("Event queue is full, dropping event")
+                self._record_tracking_error()
                 return False
 
         except Exception as e:
-            logger.error(f"Error queueing usage event: {e}")
+            logger.error(f"Failed to track usage event: {e}")
+            self._record_tracking_error()
             return False
 
     async def _validate_api_key(
@@ -2027,62 +2067,6 @@ class UsageTrackingService:
 
         return prepared_data
 
-    async def track_usage_event(
-        self,
-        request: Request,
-        endpoint: str,
-        http_method: str,
-        status_code: int,
-        character_count: int,
-        processing_time_ms: Optional[int] = None,
-        voice_id: Optional[str] = None,
-        audio_duration_ms: Optional[int] = None,
-        word_count: Optional[int] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        """Queue a usage event for background processing instead of blocking."""
-        if not self._should_track():
-            return True
-
-        try:
-            # Prepare the event data
-            event_data = {
-                "request": request,
-                "endpoint": endpoint,
-                "http_method": http_method,
-                "status_code": status_code,
-                "character_count": character_count,
-                "processing_time_ms": processing_time_ms,
-                "voice_id": voice_id,
-                "audio_duration_ms": audio_duration_ms,
-                "word_count": word_count,
-                "metadata": metadata,
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-
-            # Don't block the main request - add to queue and return immediately
-            try:
-                # Try to add to queue with a short timeout
-                await asyncio.wait_for(
-                    self.__class__._event_queue.put(event_data), timeout=0.1
-                )
-
-                # Store the request ID on the request state for later reference
-                # This allows updates for streaming requests
-                request_id = str(uuid.uuid4())
-                if hasattr(request, "state"):
-                    request.state.tracked_request_id = request_id
-
-                return True
-            except asyncio.TimeoutError:
-                # If queue is full, log but don't block the request
-                logger.warning("Usage tracking queue is full, event dropped")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error queueing usage event: {e}")
-            return False
-
     # Add a method to check the health of the tracking service
     async def check_health(self) -> Dict[str, Any]:
         """Check the health of the usage tracking service.
@@ -2286,3 +2270,42 @@ class UsageTrackingService:
         except Exception as e:
             logger.error(f"Error getting performance statistics: {e}")
             return None
+
+    async def _process_event_queue(self, force=False):
+        """Process events in the queue.
+        
+        Args:
+            force: Whether to force processing even if there are few events
+            
+        Returns:
+            bool: True if events were processed, False otherwise
+        """
+        queue_size = self.__class__._event_queue.qsize()
+        
+        # Only process if we have enough events or force is True
+        if queue_size == 0 or (queue_size < 10 and not force):
+            return False
+            
+        try:
+            # Get events from queue (up to 50)
+            events = []
+            for _ in range(min(50, queue_size)):
+                try:
+                    events.append(self.__class__._event_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+                    
+            if not events:
+                return False
+                
+            # Process the batch
+            success = await self.track_usage_events_batch(events)
+            
+            # Mark tasks as done
+            for _ in range(len(events)):
+                self.__class__._event_queue.task_done()
+                
+            return success
+        except Exception as e:
+            logger.error(f"Failed to process event queue: {e}")
+            return False

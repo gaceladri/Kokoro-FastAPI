@@ -117,6 +117,32 @@ docker run --gpus all -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-gpu:v0.2.2  #NV
 
 </details>
 
+<details>
+<summary>Manual Docker Build and Run</summary>
+
+Build and run the Docker container manually:
+
+```bash
+# Build the Docker image
+docker build -t kokoro-fastapi-gpu -f Dockerfile ../..
+
+# Run the container with GPU support
+docker run -it --rm -p 8880:8880 \
+  -v "$(pwd)/config:/app/config" \
+  --env PYTHONPATH=/app:/app/api \
+  --env USE_GPU=true \
+  --env PYTHONUNBUFFERED=1 \
+  --env ENABLE_USAGE_TRACKING=true \
+  --env SUPABASE_URL=<your-supabase-url> \
+  --env SUPABASE_KEY=<your-supabase-key> \
+  --env DOWNLOAD_MODEL=true \
+  --gpus all \
+  kokoro-fastapi-gpu
+```
+
+Replace `<your-supabase-url>` and `<your-supabase-key>` with your actual Supabase credentials.
+</details>
+
 <details open>
 <summary> Up and Running? </summary>
 
